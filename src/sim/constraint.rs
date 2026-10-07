@@ -32,6 +32,23 @@ pub struct ConstraintEval {
     pub n_blocks: usize,
 }
 
+/// The force (x, y) and torque a constraint applied to each body it
+/// touches, i.e. Jᵀλ split by block. Recorded for the force overlay.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Reaction {
+    pub n: usize,
+    pub body: [usize; MAX_BLOCKS],
+    pub f: [glam::DVec3; MAX_BLOCKS],
+}
+
+impl Reaction {
+    /// Force on `body` (summed if it appears in several blocks).
+    pub fn on(&self, body: usize) -> glam::DVec2 {
+        (0..self.n).filter(|&k| self.body[k] == body)
+            .map(|k| glam::DVec2::new(self.f[k].x, self.f[k].y)).sum()
+    }
+}
+
 impl ConstraintEval {
     #[inline]
     pub fn blocks(&self) -> &[JBlock] { &self.blocks[..self.n_blocks] }
@@ -75,6 +92,13 @@ pub trait Constraint: Send + Sync + Any {
     /// Update discrete internal state (e.g. an engine cycle) once the step
     /// is complete. Not called between RK4 stages.
     fn post_step(&mut self, _bodies: &[Body]) {}
+
+    /// Append any discrete state that evolves while simulating (an engine
+    /// cycle), so a rewind can put it back with `load_state`.
+    fn save_state(&self, _out: &mut Vec<f64>) {}
+
+    /// Read back what `save_state` wrote, advancing `input`.
+    fn load_state(&mut self, _input: &mut &[f64]) {}
 
     /// Re-capture any reference state (e.g. rolled-distance offsets) from the
     /// current configuration. Called when leaving the editor, since editor

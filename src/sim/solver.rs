@@ -14,7 +14,7 @@
 
 use glam::DVec3;
 use crate::sim::body::Body;
-use crate::sim::constraint::{Constraint, ConstraintEval};
+use crate::sim::constraint::{Constraint, ConstraintEval, Reaction};
 
 const KS: f64 = 150.0; // position feedback (Baumgarte)
 const KD: f64 = 15.0;  // velocity feedback (Baumgarte)
@@ -90,6 +90,22 @@ impl WitkinSolver {
                 body.force_accum.y += f.y;
                 body.torque_accum  += f.z;
             }
+        }
+    }
+
+    /// Jᵀλ per constraint and block from the last `apply`.
+    pub fn reactions(&self, constraints: &[Box<dyn Constraint>], out: &mut Vec<Reaction>) {
+        out.clear();
+        for (ci, (c, e)) in constraints.iter().zip(&self.evals).enumerate() {
+            let r0 = self.row_of.get(ci).copied().unwrap_or(0);
+            let mut r = Reaction { n: e.n_blocks, ..Default::default() };
+            for (k, blk) in e.blocks().iter().enumerate() {
+                r.body[k] = blk.body;
+                for row in 0..c.dim() {
+                    r.f[k] += self.x[r0 + row] * DVec3::from(blk.j[row]);
+                }
+            }
+            out.push(r);
         }
     }
 

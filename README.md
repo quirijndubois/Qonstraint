@@ -1,5 +1,7 @@
 **[▶ Run it in your browser](https://quirijndubois.github.io/Qonstraint/)**
 
+> A Chromium-based browser (Chrome, Edge, Brave…) is highly recommended, and it is meant to be run on a computer: it needs a mouse (middle drag, scroll wheel) and a large screen, so phones and tablets are not supported.
+
 # Qonstraint
 
 An interactive 2D rigid-body physics sandbox written in Rust. Bodies are held together by exact constraint forces (Witkin's method) instead of penalty springs, so linkages, rolling wheels, sliders and gas cylinders stay together while energy stays close to constant. It runs natively and in the browser (WebGPU, with a WebGL2 fallback).

@@ -16,7 +16,8 @@
 
 use glam::{DVec2, DVec3};
 use crate::sim::body::Body;
-use crate::sim::constraint::{Constraint, ConstraintEval, MAX_BLOCKS, MAX_DIM};
+use crate::sim::constraint::{Constraint, ConstraintEval, Reaction, MAX_BLOCKS, MAX_DIM};
+use crate::sim::contact::Contacts;
 use crate::sim::force::Force;
 
 /// Projection sweeps when settling a fresh configuration.
@@ -32,13 +33,16 @@ pub fn step(
     bodies: &mut [Body],
     constraints: &[Box<dyn Constraint>],
     forces: &[Box<dyn Force>],
+    contacts: &mut Contacts,
     dt: f64,
     s: &mut XpbdScratch,
+    reactions: Option<&mut Vec<Reaction>>,
 ) {
     // Applied forces at the start-of-step state.
     for b in bodies.iter_mut() { b.clear_accumulators(); }
     for f in forces { f.apply(bodies); }
     for c in constraints { c.apply_forces(bodies, dt); }
+    contacts.apply(bodies, dt);
 
     s.prev.clear();
     for b in bodies.iter_mut() {
@@ -50,7 +54,7 @@ pub fn step(
         b.angle   += dt * b.ang_vel;
     }
 
-    project(bodies, constraints, &mut s.eval);
+    project(bodies, constraints, &mut s.eval, reactions.map(|r| (r, dt)));
 
     let inv_dt = 1.0 / dt;
     for (b, &(p, a)) in bodies.iter_mut().zip(&s.prev) {
@@ -64,14 +68,24 @@ pub fn step(
 /// once before the first step of a new or edited configuration: a step
 /// would otherwise turn any existing violation C into a velocity kick C/dt.
 pub fn settle(bodies: &mut [Body], constraints: &[Box<dyn Constraint>], s: &mut XpbdScratch) {
-    for _ in 0..SETTLE_SWEEPS { project(bodies, constraints, &mut s.eval); }
+    for _ in 0..SETTLE_SWEEPS { project(bodies, constraints, &mut s.eval, None); }
 }
 
 /// One Gauss–Seidel sweep: each constraint solved exactly in its linearisation.
-fn project(bodies: &mut [Body], constraints: &[Box<dyn Constraint>], e: &mut ConstraintEval) {
+/// With `rec`, each constraint's impulse over the step (Jᵀ·Δλ/dt²) is
+/// recorded as a force.
+fn project(
+    bodies: &mut [Body], constraints: &[Box<dyn Constraint>], e: &mut ConstraintEval,
+    mut rec: Option<(&mut Vec<Reaction>, f64)>,
+) {
+    if let Some((r, _)) = rec.as_mut() { r.clear(); }
     for c in constraints {
         c.evaluate(bodies, false, e);
-        if e.n_blocks == 0 { continue; }
+        let mut reaction = Reaction { n: e.n_blocks, ..Default::default() };
+        if e.n_blocks == 0 {
+            if let Some((r, _)) = rec.as_mut() { r.push(reaction); }
+            continue;
+        }
         let n = c.dim();
 
         // K = J W Jᵀ (n×n), WJᵀ columns kept for the update.
@@ -92,7 +106,17 @@ fn project(bodies: &mut [Body], constraints: &[Box<dyn Constraint>], e: &mut Con
 
         let mut dl = [0.0f64; MAX_DIM];
         for r in 0..n { dl[r] = -e.c[r]; }
-        if !solve_spd(&mut k, &mut dl, n) { continue; }
+        let solved = solve_spd(&mut k, &mut dl, n);
+        if let Some((rv, dt)) = rec.as_mut() {
+            for (bi, blk) in e.blocks().iter().enumerate() {
+                reaction.body[bi] = blk.body;
+                if solved {
+                    for r in 0..n { reaction.f[bi] += dl[r] / (*dt * *dt) * DVec3::from(blk.j[r]); }
+                }
+            }
+            rv.push(reaction);
+        }
+        if !solved { continue; }
 
         for (bi, blk) in e.blocks().iter().enumerate() {
             let mut dq = DVec3::ZERO;

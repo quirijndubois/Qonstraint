@@ -23,6 +23,8 @@ pub struct Body {
     pub torque_accum: f64,
     pub shape: BodyShape,
     pub fixed: bool,
+    /// Takes part in collisions (`contact.rs`).
+    pub collide: bool,
 }
 
 /// A body's rotation, `(cos θ, sin θ)`, computed once and reused for every
@@ -57,11 +59,17 @@ impl Body {
             torque_accum: 0.0,
             shape,
             fixed: false,
+            collide: false,
         }
     }
 
     pub fn fixed(mut self) -> Self {
         self.fixed = true;
+        self
+    }
+
+    pub fn colliding(mut self) -> Self {
+        self.collide = true;
         self
     }
 

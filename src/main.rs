@@ -1,6 +1,8 @@
+mod analysis;
 mod app;
 mod editor;
 mod renderer;
+mod scene_file;
 mod scenes;
 mod sim;
 

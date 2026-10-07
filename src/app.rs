@@ -7,6 +7,8 @@ use winit::{
     window::Window,
 };
 
+use crate::analysis::{Analysis, Butterfly, UndoStack};
+use crate::scene_file::SceneFile;
 use crate::editor::{
     connection_handles, move_handle, snap_point, BodyEdit, ConstraintKind, Editor, EditorMode,
     HandleRef, LinkHover, StepMode,
@@ -15,7 +17,7 @@ use crate::sim::forces::Gravity;
 use crate::renderer::{
     camera::Camera,
     geometry::GeometryBuilder,
-    hud::{Hud, Metrics},
+    hud::{Hud, HudOutput, Metrics, UndoState},
     state::RenderState,
 };
 use crate::scenes::SCENES;
@@ -30,6 +32,13 @@ use crate::sim::{
 const MAX_AUTO_STEPS: f32 = 1_000_000.0;
 /// Trace samples per second of trail (one sample per rendered frame).
 const TRACE_FPS: f32 = 60.0;
+
+/// Overlay scale that follows the largest value on show: up at once (so
+/// nothing overflows), down slowly (so it doesn't flicker).
+fn smooth_scale(current: f32, max: f32) -> f32 {
+    if !max.is_finite() || max <= 0.0 { return current; }
+    if max > current { max } else { (current * 0.98 + max * 0.02).max(1e-3) }
+}
 
 /// Zoom (world units per pixel) that fits `view` (world w × h) in `screen`.
 fn fit_scale(view: [f32; 2], screen: Vec2) -> f32 {
@@ -76,6 +85,21 @@ pub struct App {
     fps_smooth:  f32,
     pub window_size: winit::dpi::PhysicalSize<u32>,
     pub frame_count: u64,
+
+    /// Rewind, butterfly, phase plot, overlays, share panel.
+    analysis: Analysis,
+    undo:     UndoStack,
+    /// Left button held in the viewport (an edit in progress).
+    left_down: bool,
+    /// Smoothed largest force and rod load on show, for overlay scaling.
+    force_scale: f32,
+    load_scale:  f32,
+    /// A world loaded from a share code (JSON, so RESET reloads it) and the
+    /// view it was shared with, which replaces the scene's for fitting.
+    custom: Option<String>,
+    custom_view: Option<[f32; 2]>,
+    #[cfg(target_arch = "wasm32")]
+    last_hash: String,
 }
 
 impl App {
@@ -96,7 +120,7 @@ impl App {
             c
         };
 
-        Self {
+        let mut app = Self {
             render_state,
             camera,
             geo: GeometryBuilder::new(),
@@ -123,16 +147,126 @@ impl App {
             fps_smooth: 60.0,
             window_size: window.inner_size(),
             frame_count: 0,
+            analysis: Analysis::default(),
+            undo: UndoStack::default(),
+            left_down: false,
+            force_scale: 1.0,
+            load_scale: 1.0,
+            custom: None,
+            custom_view: None,
+            #[cfg(target_arch = "wasm32")]
+            last_hash: String::new(),
+        };
+        app.undo.reset(&app.world);
+        #[cfg(target_arch = "wasm32")]
+        app.check_url_hash();
+        app
+    }
+
+    /// Swap in a whole new world (undo, redo, a loaded share code), keeping
+    /// the app's mouse spring and solver choice, and dropping everything
+    /// tied to the old one.
+    fn replace_world(&mut self, mut w: World) {
+        w.add_force(MouseSpring(self.mouse_spring.clone()));
+        w.integrator = self.editor.integrator;
+        self.world = w;
+        self.mouse_spring.lock().unwrap().active = false;
+        self.picked = None;
+        self.drag_candidate = None;
+        self.traces.clear();
+        self.analysis.timeline.clear();
+        self.analysis.butterfly = None;
+        self.analysis.phase.clear();
+        self.editor.mode = EditorMode::Idle;
+        self.editor.body_edit = None;
+        self.editor.inspect_shape = None;
+        self.anchor_ref_y = crate::scenes::free_com_y(&self.world);
+        if let Some(g) = self.world.forces.iter().find_map(|f| f.as_any().downcast_ref::<Gravity>().map(|g| g.g)) {
+            self.editor.gravity = g;
         }
+    }
+
+    /// The current world as a share code, with the camera's view.
+    fn share_code(&self) -> String {
+        let mut file = SceneFile::from_world(&self.world);
+        let screen = self.screen_size() * self.camera.scale;
+        file.view = Some([self.camera.center.x, self.camera.center.y, screen.x, screen.y]);
+        file.to_code()
+    }
+
+    /// Load a share code (or link). False if it doesn't decode.
+    fn load_code(&mut self, code: &str) -> bool {
+        let Some(file) = SceneFile::from_code(code) else { return false };
+        self.replace_world(file.to_world());
+        if let Some([cx, cy, w, h]) = file.view {
+            self.camera.center = Vec2::new(cx, cy);
+            self.custom_view = Some([w, h]);
+            self.camera.scale = fit_scale([w, h], self.screen_size());
+            self.camera_fitted = true;
+        }
+        self.custom = Some(file.to_json());
+        self.undo.reset(&self.world);
+        self.editor.active = false;
+        self.editor.paused = false;
+        true
+    }
+
+    /// In the browser a share link carries the scene in `#s=…`; load it at
+    /// start and whenever the hash changes (a pasted link).
+    #[cfg(target_arch = "wasm32")]
+    fn check_url_hash(&mut self) {
+        let Some(hash) = web_sys::window().and_then(|w| w.location().hash().ok()) else { return };
+        if hash == self.last_hash { return; }
+        self.last_hash = hash.clone();
+        if let Some(code) = hash.strip_prefix("#s=") {
+            if !self.load_code(code) { log::warn!("share link did not decode"); }
+        }
+    }
+
+    /// Publish the share code: clipboard natively, URL hash (and clipboard,
+    /// if the browser allows) on the web.
+    fn share(&mut self) {
+        let code = self.share_code();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.hud.copy_text(code.clone());
+            self.analysis.share_note = format!("Copied // {} chars", code.len());
+            self.analysis.share_code = code;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let Some(win) = web_sys::window() else { return };
+            let loc = win.location();
+            let hash = format!("#s={code}");
+            let _ = loc.set_hash(&hash);
+            self.last_hash = hash;
+            let base = loc.href().ok().map(|h| h.split('#').next().unwrap_or("").to_owned()).unwrap_or_default();
+            let link = format!("{base}#s={code}");
+            let _ = win.navigator().clipboard().write_text(&link);
+            self.analysis.share_note = "Link in the address bar and clipboard".to_owned();
+            self.analysis.share_code = link;
+        }
+    }
+
+    fn do_undo(&mut self, redo: bool) {
+        let w = if redo { self.undo.redo() } else { self.undo.undo() };
+        if let Some(w) = w { self.replace_world(w); }
     }
 
     /// Enter/leave edit mode. Editor moves teleport bodies, so constraints
     /// with reference state (rolling) re-capture it before physics resumes.
     fn toggle_editor(&mut self) {
         self.editor.toggle();
-        if !self.editor.active {
+        // The ghost can't follow edits.
+        self.analysis.butterfly = None;
+        if self.editor.active {
+            self.undo.commit(&self.world);
+        } else {
             self.world.rebase();
             self.traces.clear();
+            self.analysis.timeline.clear();
+            self.analysis.butterfly = None;
+            self.analysis.phase.clear();
         }
     }
 
@@ -201,6 +335,12 @@ impl App {
         self.drag_candidate = None;
         self.world = Self::build_scene(idx, self.mouse_spring.clone());
         self.anchor_ref_y = crate::scenes::free_com_y(&self.world);
+        self.custom = None;
+        self.custom_view = None;
+        self.analysis.timeline.clear();
+        self.analysis.butterfly = None;
+        self.analysis.phase.clear();
+        self.undo.reset(&self.world);
         self.editor.mode = EditorMode::Idle;
         self.editor.body_edit = None;
         self.editor.inspect_shape = None;
@@ -359,6 +499,7 @@ impl App {
                         let (fa, fb) = (&self.world.bodies[first], &self.world.bodies[second]);
                         self.editor.pair_can_roll = crate::editor::can_roll(fa, fb);
                         self.editor.pair_can_slide = crate::editor::can_slide(fa, fb);
+                        self.editor.pair_can_gear = crate::editor::can_gear(fa, fb);
                         self.editor.mode = EditorMode::BothSelected {
                             body_a:   first,
                             attach_a,
@@ -391,6 +532,16 @@ impl App {
                 self.editor.mode = EditorMode::Idle;
             }
 
+            EditorMode::PulleyPending { body_a, attach_a, body_b, attach_b } => {
+                if let Some((p, _)) = self.pick_body(raw) {
+                    if crate::editor::add_rope_over(body_a, attach_a, body_b, attach_b, p, &mut self.world) {
+                        self.editor.mode = EditorMode::Idle;
+                    }
+                } else {
+                    self.editor.mode = EditorMode::Idle;
+                }
+            }
+
             EditorMode::PlacingTrace { body_idx } => {
                 // The point may lie off the body: it rides along rigidly.
                 if let Some(body) = self.world.bodies.get(body_idx) {
@@ -406,6 +557,10 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: &WindowEvent) -> bool {
+        // A release over the HUD still ends a press that began in the scene.
+        if let WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } = event {
+            self.left_down = false;
+        }
         if self.hud.on_window_event(self.window, event) {
             return true;
         }
@@ -415,7 +570,8 @@ impl App {
                 self.render_state.resize(*size);
                 self.window_size = *size;
                 if self.camera_fitted && size.width > 0 && size.height > 0 {
-                    self.camera.scale = fit_scale(SCENES[self.current_scene_idx].view_size, self.screen_size());
+                    let view = self.custom_view.unwrap_or(SCENES[self.current_scene_idx].view_size);
+                    self.camera.scale = fit_scale(view, self.screen_size());
                 }
             }
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key, state, .. }, .. } => {
@@ -445,6 +601,12 @@ impl App {
                                     self.inspect_body(body_idx);
                                 }
                             }
+                        }
+                        PhysicalKey::Code(KeyCode::KeyZ) if self.editor.active && self.ctrl_held => {
+                            self.do_undo(self.shift_held);
+                        }
+                        PhysicalKey::Code(KeyCode::KeyY) if self.editor.active && self.ctrl_held => {
+                            self.do_undo(true);
                         }
                         PhysicalKey::Code(KeyCode::Escape) => {
                             if self.editor.active {
@@ -514,6 +676,7 @@ impl App {
                         self.middle_pressed = *state == ElementState::Pressed;
                     }
                     MouseButton::Left => {
+                        self.left_down = *state == ElementState::Pressed;
                         let wp = self.world_mouse();
                         if *state == ElementState::Pressed {
                             if self.editor.active {
@@ -543,6 +706,7 @@ impl App {
                                         | EditorMode::PlacingTrace { .. }
                                         | EditorMode::FirstSelected { .. }
                                         | EditorMode::BothSelected { .. }
+                                        | EditorMode::PulleyPending { .. }
                                         | EditorMode::PinWorldPending { .. })
                                 {
                                     if let Some((idx, _)) = self.pick_body(wp) {
@@ -626,15 +790,34 @@ impl App {
             // freezing. That frame's sim time is cut short, as with the dt cap.
             let limit = 2.0 / self.editor.target_fps.max(1.0);
             let guard = self.editor.step_mode == StepMode::TargetFps;
+            self.world.record_reactions = self.analysis.show_forces;
+            if self.analysis.show_chaos && self.analysis.butterfly.is_none() && !self.editor.active {
+                self.analysis.butterfly = Some(Butterfly::seed(&self.world, &self.mouse_spring));
+            }
+            if let Some(bf) = &mut self.analysis.butterfly {
+                bf.ghost.integrator = self.editor.integrator;
+                for f in bf.ghost.forces.iter_mut() {
+                    if let Some(g) = f.as_any_mut().downcast_mut::<Gravity>() { g.g = self.editor.gravity; }
+                }
+            }
             let t0 = web_time::Instant::now();
             let mut done = 0;
             while done < steps {
                 self.world.step(sub_dt);
+                if let Some(bf) = &mut self.analysis.butterfly { bf.ghost.step(sub_dt); }
+                if self.analysis.show_phase { self.analysis.phase.after_step(&self.world); }
                 done += 1;
                 if guard && done % 256 == 0 && t0.elapsed().as_secs_f32() > limit { break; }
             }
             self.physics_time = t0.elapsed().as_secs_f32();
             self.hold_grabbed_body();
+            let sim_dt = (sub_dt * done as f32) as f64;
+            if let Some(bf) = &mut self.analysis.butterfly { bf.sample(&self.world, sim_dt); }
+            if self.analysis.show_phase {
+                self.analysis.phase.ensure_bodies(&self.world);
+                self.analysis.phase.after_frame(&self.world);
+            }
+            if !self.editor.active { self.analysis.timeline.record(&self.world, sim_dt); }
             let per_step = self.physics_time / done as f32;
             self.step_cost = if self.step_cost > 0.0 { self.step_cost * 0.9 + per_step * 0.1 } else { per_step };
 
@@ -665,8 +848,22 @@ impl App {
         if self.editor.active {
             self.anchor_ref_y = crate::scenes::free_com_y(&self.world);
         }
-        crate::scenes::draw_world(&self.world, self.anchor_ref_y, &mut self.geo);
+        let tints = if self.analysis.show_forces {
+            let (t, max) = crate::scenes::force_tints(&self.world, self.load_scale);
+            self.load_scale = smooth_scale(self.load_scale, max);
+            t
+        } else {
+            Vec::new()
+        };
+        crate::scenes::draw_world(&self.world, self.anchor_ref_y, &tints, &mut self.geo);
         self.draw_traces();
+        if let Some(bf) = &self.analysis.butterfly {
+            crate::scenes::draw_ghost(&bf.ghost, &mut self.geo, self.camera.scale);
+        }
+        if self.analysis.show_forces {
+            let max = crate::scenes::draw_force_arrows(&self.world, &mut self.geo, self.camera.scale, self.force_scale);
+            self.force_scale = smooth_scale(self.force_scale, max);
+        }
 
         // Editor overlays
         if self.editor.active {
@@ -701,6 +898,12 @@ impl App {
         let scene_count = SCENES.len();
         let def         = &SCENES[idx];
         let size        = [self.window_size.width, self.window_size.height];
+        let (name, desc) = if self.custom.is_some() {
+            ("Shared Scene", "Loaded from a share code  ·  RESET reloads it")
+        } else {
+            (def.name, def.description)
+        };
+        let undo_state = UndoState { can_undo: self.undo.can_undo(), can_redo: self.undo.can_redo() };
 
         let hud_out = self.hud.encode(
             self.window,
@@ -712,11 +915,14 @@ impl App {
             &metrics,
             idx,
             scene_count,
-            def.name,
-            def.description,
+            name,
+            desc,
             &mut self.editor,
             &mut self.world,
+            &mut self.analysis,
+            undo_state,
         );
+        self.handle_analysis(&hud_out);
 
         // Handle pending constraint from editor panel
         if let Some(kind) = self.editor.pending_constraint.take() {
@@ -727,6 +933,8 @@ impl App {
                         body_idx: body_a,
                         attach:   attach_a,
                     };
+                } else if kind == ConstraintKind::RopeOverPulley {
+                    self.editor.mode = EditorMode::PulleyPending { body_a, attach_a, body_b, attach_b };
                 } else {
                     let k = self.editor.spring_k;
                     let d = self.editor.spring_d;
@@ -776,7 +984,14 @@ impl App {
         } else if hud_out.reset_scene {
             // Keep the user's gravity across a reset (the rebuilt world starts at 9.81).
             let g = self.editor.gravity;
-            self.load_scene(idx);
+            match self.custom.take().and_then(|j| SceneFile::from_json(&j)) {
+                Some(file) => {
+                    self.replace_world(file.to_world());
+                    self.custom = Some(file.to_json());
+                    self.undo.reset(&self.world);
+                }
+                None => self.load_scene(idx),
+            }
             self.editor.gravity = g;
         } else if hud_out.next_scene {
             let next = (idx + 1) % scene_count;
@@ -786,9 +1001,51 @@ impl App {
             self.load_scene(prev);
         }
 
+        // Undo snapshots: whenever a paused edit has settled (no button
+        // held in the scene or on a slider), record it if anything changed.
+        if self.editor.active && self.editor.paused && !self.left_down && !hud_out.pointer_busy
+            && matches!(self.editor.mode, EditorMode::Idle | EditorMode::Inspecting { .. })
+        {
+            self.undo.commit(&self.world);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        if self.frame_count % 30 == 0 { self.check_url_hash(); }
+
         self.render_state.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
+    }
+
+    /// Act on the HUD's analysis requests.
+    fn handle_analysis(&mut self, out: &HudOutput) {
+        if out.undo { self.do_undo(false); }
+        if out.redo { self.do_undo(true); }
+        if out.share { self.share(); }
+        if out.load_code {
+            let code = std::mem::take(&mut self.analysis.paste);
+            if !self.load_code(&code) {
+                self.analysis.paste = code;
+                self.analysis.share_note = "That code did not load".to_owned();
+            } else {
+                self.analysis.share_note = "Loaded".to_owned();
+            }
+        }
+        if out.toggle_chaos {
+            self.analysis.show_chaos = !self.analysis.show_chaos;
+            self.analysis.butterfly = None;
+        }
+        if out.reseed_chaos {
+            self.analysis.butterfly = Some(Butterfly::seed(&self.world, &self.mouse_spring));
+        }
+        if let Some(i) = out.scrub {
+            if self.analysis.timeline.seek(&mut self.world, i) {
+                self.editor.paused = true;
+                self.traces.clear();
+                self.analysis.butterfly = None;
+                self.analysis.phase.trail.clear();
+            }
+        }
     }
 
     /// Editor overlay in the same visual language as the scene: white
@@ -899,6 +1156,21 @@ impl App {
                 self.geo.draw_dashed(attach_a, attach_b, 0.016, 0.08, 0.06, SEL);
                 self.draw_reticle(attach_a, SEL);
                 self.draw_reticle(attach_b, SEL_B);
+            }
+            EditorMode::PulleyPending { body_a, attach_a, body_b, attach_b } => {
+                self.draw_brackets(body_a, SEL);
+                self.draw_brackets(body_b, SEL);
+                self.draw_reticle(attach_a, SEL);
+                self.draw_reticle(attach_b, SEL);
+                let target = self.pick_body(raw)
+                    .filter(|&(i, _)| self.world.bodies.get(i).is_some_and(crate::editor::is_disk))
+                    .map(|(i, _)| i);
+                let via = match target {
+                    Some(i) => { self.draw_brackets(i, SEL_B); self.world.bodies[i].pos32() }
+                    None => cursor,
+                };
+                self.geo.draw_dashed(attach_a, via, 0.016, 0.08, 0.06, SEL);
+                self.geo.draw_dashed(via, attach_b, 0.016, 0.08, 0.06, SEL);
             }
             EditorMode::PinWorldPending { body_idx, attach } => {
                 self.draw_brackets(body_idx, SEL);

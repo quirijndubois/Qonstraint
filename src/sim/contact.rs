@@ -125,28 +125,30 @@ fn bound_radius(b: &Body) -> f64 {
 /// Push contacts between bodies `i` and `j` onto `out`.
 fn collide_pair(bodies: &[Body], i: usize, j: usize, out: &mut Vec<ContactPoint>) {
     let (bi, bj) = (&bodies[i], &bodies[j]);
-    let mut push = |feature: u8, from: DVec2, to: DVec2, ri: f64, rj: f64, fallback: DVec2| {
-        // `from` on i's core (centre / segment), `to` on j's.
+    // `from` on i's core (centre / segment), `to` on j's.
+    #[allow(clippy::too_many_arguments)]
+    fn push(out: &mut Vec<ContactPoint>, i: usize, j: usize, feature: u8, from: DVec2, to: DVec2, ri: f64, rj: f64, fallback: DVec2) {
         let d = to - from;
         let dist = d.length();
         let pen = ri + rj - dist;
         if pen <= 0.0 { return; }
         let n = if dist > 1e-9 { d / dist } else { fallback };
         out.push(ContactPoint { i, j, feature, n, pen, p: from + n * (ri - 0.5 * pen), f_n: 0.0, f_t: 0.0 });
-    };
+    }
+    let push = |out: &mut Vec<ContactPoint>, feature, from, to, ri, rj, fallback| push(out, i, j, feature, from, to, ri, rj, fallback);
     match (&bi.shape, &bj.shape) {
         (BodyShape::Disk { radius: ri }, BodyShape::Disk { radius: rj }) => {
-            push(0, bi.pos, bj.pos, *ri as f64, *rj as f64, DVec2::Y);
+            push(out, 0, bi.pos, bj.pos, *ri as f64, *rj as f64, DVec2::Y);
         }
         (BodyShape::Rod { .. }, BodyShape::Disk { radius }) => {
             let (a, b, hw) = segment(bi).unwrap();
             let (q, _) = closest_on_segment(a, b, bj.pos);
-            push(0, q, bj.pos, hw, *radius as f64, (b - a).perp().normalize_or(DVec2::Y));
+            push(out, 0, q, bj.pos, hw, *radius as f64, (b - a).perp().normalize_or(DVec2::Y));
         }
         (BodyShape::Disk { radius }, BodyShape::Rod { .. }) => {
             let (a, b, hw) = segment(bj).unwrap();
             let (q, _) = closest_on_segment(a, b, bi.pos);
-            push(0, bi.pos, q, *radius as f64, hw, -(b - a).perp().normalize_or(DVec2::Y));
+            push(out, 0, bi.pos, q, *radius as f64, hw, -(b - a).perp().normalize_or(DVec2::Y));
         }
         (BodyShape::Rod { .. }, BodyShape::Rod { .. }) => {
             let (a1, b1, h1) = segment(bi).unwrap();
@@ -157,16 +159,16 @@ fn collide_pair(bodies: &[Body], i: usize, j: usize, out: &mut Vec<ContactPoint>
             let m1 = (b1 - a1).perp().normalize_or(DVec2::Y);
             for (f, e) in [(0u8, a1), (1, b1)] {
                 let (q, _) = closest_on_segment(a2, b2, e);
-                push(f, e, q, h1, h2, -m2);
+                push(out, f, e, q, h1, h2, -m2);
             }
             for (f, e) in [(2u8, a2), (3, b2)] {
                 let (q, _) = closest_on_segment(a1, b1, e);
-                push(f, q, e, h1, h2, m1);
+                push(out, f, q, e, h1, h2, m1);
             }
             // Crossing in the middles (no end involved).
             if out.len() == before {
                 let (c1, _, c2, _) = closest_segments(a1, b1, a2, b2);
-                push(4, c1, c2, h1, h2, m1);
+                push(out, 4, c1, c2, h1, h2, m1);
             }
         }
         _ => {}

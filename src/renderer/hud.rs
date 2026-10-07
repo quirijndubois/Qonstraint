@@ -7,11 +7,16 @@ use egui::{
 use egui_wgpu::ScreenDescriptor;
 use winit::window::Window;
 
+use crate::analysis::{free_bodies, Analysis, PlotMode};
 use crate::editor::{BodyTemplate, ConstraintKind, Editor, EditorMode, LinkHover, StepMode};
 use crate::sim::{
     body::BodyShape,
-    constraints::{cylinder::{GasMode, Stroke as GasStroke}, Cylinder, DistanceConstraint, PinJoint, PinWorld, RollingContact, RollingOnRod, SliderJoint},
-    forces::{spring::SpringDamper, Motor},
+    constraint::Constraint,
+    constraints::{
+        cylinder::{GasMode, Stroke as GasStroke}, Cylinder, DistanceConstraint, GearJoint, GearKind,
+        PinJoint, PinWorld, RollingContact, RollingOnRod, Rope, SliderJoint,
+    },
+    forces::{spring::SpringDamper, Motor, TorsionSpring},
     world::{Integrator, World},
 };
 
@@ -66,7 +71,21 @@ pub struct HudOutput {
     pub next_scene:   bool,
     pub reset_scene:  bool,
     pub toggle_edit:  bool,
+    pub undo:         bool,
+    pub redo:         bool,
+    pub share:        bool,
+    pub load_code:    bool,
+    /// Rewind to this timeline frame.
+    pub scrub:        Option<usize>,
+    pub toggle_chaos: bool,
+    pub reseed_chaos: bool,
+    /// A pointer button is held over the HUD (a slider being dragged).
+    pub pointer_busy: bool,
 }
+
+/// What the editor panel needs to know about undo.
+#[derive(Clone, Copy, Default)]
+pub struct UndoState { pub can_undo: bool, pub can_redo: bool }
 
 // ── HUD ──────────────────────────────────────────────────────────────────────
 
@@ -148,6 +167,8 @@ impl Hud {
         scene_desc:   &str,
         editor:       &mut Editor,
         world:        &mut World,
+        analysis:     &mut Analysis,
+        undo:         UndoState,
     ) -> HudOutput {
         self.history.push(metrics);
         let raw_input = self.winit_state.take_egui_input(window);
@@ -155,10 +176,16 @@ impl Hud {
         let mut out = HudOutput::default();
         let history = &self.history;
         let full_output = self.ctx.run(raw_input, |ctx| {
-            out = draw_main_panel(ctx, metrics, history, scene_idx, scene_count, scene_name, scene_desc, editor);
+            out = draw_main_panel(ctx, metrics, history, scene_idx, scene_count, scene_name, scene_desc, editor, analysis);
             if editor.active {
-                draw_editor_panel(ctx, editor, world);
+                draw_editor_panel(ctx, editor, world, undo, &mut out);
+            } else {
+                draw_timeline(ctx, analysis, &mut out);
             }
+            if analysis.show_share { draw_share_panel(ctx, analysis, &mut out); }
+            if analysis.show_phase { draw_phase_panel(ctx, analysis, world); }
+            if analysis.show_chaos { draw_chaos_panel(ctx, analysis, &mut out); }
+            out.pointer_busy = ctx.input(|i| i.pointer.any_down()) && ctx.is_pointer_over_area();
         });
 
         self.winit_state.handle_platform_output(window, full_output.platform_output);
@@ -196,6 +223,11 @@ impl Hud {
         }
 
         out
+    }
+
+    /// Put text on the clipboard (native; the browser has no egui clipboard).
+    pub fn copy_text(&self, s: String) {
+        self.ctx.copy_text(s);
     }
 }
 
@@ -256,6 +288,7 @@ fn draw_main_panel(
     scene_name:  &str,
     scene_desc:  &str,
     editor:      &mut Editor,
+    analysis:    &mut Analysis,
 ) -> HudOutput {
     let mut out = HudOutput::default();
 
@@ -325,6 +358,21 @@ fn draw_main_panel(
                     }
                 }
                 log_slider_row(ui, "SPEED", &mut editor.time_scale, 0.05, 20.0);
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(58.0, 18.0), Sense::hover());
+                    ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, "SHOW", font(BODY_SIZE), WHITE);
+                    if hud_btn(ui, "FORCES", analysis.show_forces, 0.0).clicked() { analysis.show_forces = !analysis.show_forces; }
+                    if hud_btn(ui, "PHASE", analysis.show_phase, 0.0).clicked() { analysis.show_phase = !analysis.show_phase; }
+                    if hud_btn(ui, "CHAOS", analysis.show_chaos, 0.0).clicked() { out.toggle_chaos = true; }
+                    if hud_btn(ui, "SHARE", analysis.show_share, 0.0).clicked() {
+                        analysis.show_share = !analysis.show_share;
+                        if analysis.show_share { out.share = true; }
+                    }
+                });
+                if analysis.show_forces {
+                    ui.label(text("Arrows: joint and contact forces", SMALL_SIZE, MUTED));
+                    ui.label(text("Rods: red in tension, blue in compression", SMALL_SIZE, MUTED));
+                }
                 ui.add_space(10.0);
 
                 // Status line
@@ -383,7 +431,7 @@ fn sparkline(ui: &mut egui::Ui, history: &VecDeque<f32>) {
 
 // ── Editor panel ──────────────────────────────────────────────────────────────
 
-fn draw_editor_panel(ctx: &egui::Context, editor: &mut Editor, world: &mut World) {
+fn draw_editor_panel(ctx: &egui::Context, editor: &mut Editor, world: &mut World, undo: UndoState, out: &mut HudOutput) {
     egui::Area::new(egui::Id::new("editor_panel"))
         .anchor(Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
         .show(ctx, |ui| {
@@ -398,13 +446,19 @@ fn draw_editor_panel(ctx: &egui::Context, editor: &mut Editor, world: &mut World
                     .max_height(max_h)
                     .min_scrolled_height(max_h)
                     .auto_shrink([false, true])
-                    .show(ui, |ui| editor_panel_contents(ui, editor, world));
+                    .show(ui, |ui| editor_panel_contents(ui, editor, world, undo, out));
             });
         });
 }
 
-fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut World) {
-    ui.label(text("Editor", TITLE_SIZE, WHITE));
+fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut World, undo: UndoState, out: &mut HudOutput) {
+    ui.horizontal(|ui| {
+        ui.label(text("Editor", TITLE_SIZE, WHITE));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if dim_btn(ui, "REDO", undo.can_redo).clicked() { out.redo = true; }
+            if dim_btn(ui, "UNDO", undo.can_undo).clicked() { out.undo = true; }
+        });
+    });
     ui.add_space(8.0);
 
     // New body: only while nothing is selected, so a selection's
@@ -439,7 +493,10 @@ fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut Wor
             }
         }
         if editor.body_props.template != BodyTemplate::Anchor {
-            toggle_row(ui, "FIXED", &mut editor.body_props.fixed);
+            ui.horizontal(|ui| {
+                toggle_row(ui, "FIXED", &mut editor.body_props.fixed);
+                toggle_row(ui, "COLLIDE", &mut editor.body_props.collide);
+            });
         }
         ui.add_space(4.0);
         let placing = matches!(editor.mode, EditorMode::PlacingBody);
@@ -447,6 +504,12 @@ fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut Wor
         if hud_btn(ui, place_lbl, placing, ui.available_width()).clicked() {
             editor.mode = if placing { EditorMode::Idle } else { EditorMode::PlacingBody };
         }
+
+        ui.add_space(10.0);
+        ui.label(text("Contact", HEAD_SIZE, WHITE));
+        slider_row(ui, "FRICTION", &mut world.contacts.friction, 0.0, 1.5);
+        slider_row(ui, "BOUNCE", &mut world.contacts.restitution, 0.0, 1.0);
+        ui.label(text("Between bodies marked collide", SMALL_SIZE, MUTED));
     }
 
     // Connection picker
@@ -457,14 +520,22 @@ fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut Wor
             ("PIN JOINT",    ConstraintKind::PinJoint),
             ("DISTANCE ROD", ConstraintKind::Distance),
             ("ROLLING",      ConstraintKind::RollingContact),
+            ("GEAR",         ConstraintKind::Gear),
+            ("BELT",         ConstraintKind::Belt),
             ("SLIDER",       ConstraintKind::Slider),
             ("CYLINDER",     ConstraintKind::Cylinder),
+            ("ROPE",         ConstraintKind::Rope),
+            ("ROPE OVER PULLEY", ConstraintKind::RopeOverPulley),
             ("SPRING",       ConstraintKind::Spring),
+            ("TORSION SPRING", ConstraintKind::Torsion),
         ] {
             if kind == ConstraintKind::RollingContact && !editor.pair_can_roll {
                 continue;
             }
             if matches!(kind, ConstraintKind::Slider | ConstraintKind::Cylinder) && !editor.pair_can_slide {
+                continue;
+            }
+            if matches!(kind, ConstraintKind::Gear | ConstraintKind::Belt) && !editor.pair_can_gear {
                 continue;
             }
             if hud_btn(ui, lbl, false, ui.available_width()).clicked() {
@@ -477,6 +548,9 @@ fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut Wor
         if !editor.pair_can_roll {
             ui.label(text("Rolling needs a disk + disk or rod", SMALL_SIZE, MUTED));
         }
+        if !editor.pair_can_gear {
+            ui.label(text("Gear and belt need two disks", SMALL_SIZE, MUTED));
+        }
         if hud_btn(ui, "CANCEL", false, ui.available_width()).clicked() {
             editor.mode = EditorMode::Idle;
         }
@@ -484,6 +558,18 @@ fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut Wor
         ui.label(text("New spring", SMALL_SIZE, MUTED));
         slider_row(ui, "STIFF", &mut editor.spring_k, 1.0, 500.0);
         slider_row(ui, "DAMP",  &mut editor.spring_d, 0.0, 50.0);
+        ui.label(text("New torsion spring", SMALL_SIZE, MUTED));
+        slider_row(ui, "STIFF", &mut editor.torsion_k, 0.5, 200.0);
+        slider_row(ui, "DAMP",  &mut editor.torsion_d, 0.0, 10.0);
+    }
+
+    if let EditorMode::PulleyPending { .. } = editor.mode {
+        ui.add_space(10.0);
+        ui.label(text("Rope over pulley", HEAD_SIZE, WHITE));
+        ui.label(text("Click the disk the rope runs over", SMALL_SIZE, MUTED));
+        if hud_btn(ui, "CANCEL", false, ui.available_width()).clicked() {
+            editor.mode = EditorMode::Idle;
+        }
     }
 
     // Selected body
@@ -504,7 +590,10 @@ fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut Wor
             if shape != "Point" {
                 slider_row(ui, "ANGLE", &mut edit.angle, -180.0, 180.0);
             }
-            toggle_row(ui, "FIXED", &mut edit.fixed);
+            ui.horizontal(|ui| {
+                toggle_row(ui, "FIXED", &mut edit.fixed);
+                if shape != "Point" { toggle_row(ui, "COLLIDE", &mut edit.collide); }
+            });
             ui.add_space(4.0);
             if danger_btn(ui, "DELETE", ui.available_width()).clicked() {
                 editor.delete_requested = true;
@@ -543,6 +632,7 @@ fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut Wor
         EditorMode::FirstSelected { .. } => "Click 2nd body",
         EditorMode::BothSelected { .. }  => "Pick a connection",
         EditorMode::PinWorldPending { .. } => "Click anchor point",
+        EditorMode::PulleyPending { .. } => "Click the pulley disk",
         EditorMode::Dragging { .. }      => "Dragging",
         EditorMode::DraggingHandle { .. } => "Moving point",
         EditorMode::Rotating { .. }      => "Rotating (CTRL snaps 15 deg)",
@@ -552,6 +642,225 @@ fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut Wor
     };
     ui.label(text(format!("> {status}"), BODY_SIZE, WHITE));
     ui.label(text("CTRL snap // R rotate // DEL delete // ESC deselect", SMALL_SIZE, MUTED));
+    ui.label(text("CTRL+Z undo // CTRL+SHIFT+Z redo", SMALL_SIZE, MUTED));
+}
+
+// ── Analysis panels ───────────────────────────────────────────────────────────
+
+/// Scrub bar along the bottom: drag to rewind, PLAY resumes from there.
+fn draw_timeline(ctx: &egui::Context, a: &mut Analysis, out: &mut HudOutput) {
+    let n = a.timeline.len();
+    if n < 2 { return; }
+    let screen = ctx.screen_rect();
+    let width = (screen.width() - 32.0).clamp(200.0, 720.0);
+    egui::Area::new(egui::Id::new("timeline"))
+        .anchor(Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
+        .show(ctx, |ui| {
+            panel_frame().inner_margin(Margin::symmetric(12.0, 8.0)).show(ui, |ui| {
+                ui.set_width(width);
+                ui.horizontal(|ui| {
+                    ui.label(text("Rewind", BODY_SIZE, WHITE));
+                    let mut i = a.timeline.cursor.unwrap_or(n - 1);
+                    let before = i;
+                    ui.spacing_mut().slider_width = width - 190.0;
+                    ui.add(egui::Slider::new(&mut i, 0..=n - 1).show_value(false));
+                    let age = a.timeline.age(i);
+                    let lbl = if a.timeline.cursor.is_some() { format!("-{age:.1} S") } else { "LIVE".to_owned() };
+                    ui.label(text(lbl, BODY_SIZE, if a.timeline.cursor.is_some() { RED } else { WHITE }));
+                    if i != before { out.scrub = Some(i); }
+                });
+            });
+        });
+}
+
+fn draw_share_panel(ctx: &egui::Context, a: &mut Analysis, out: &mut HudOutput) {
+    egui::Area::new(egui::Id::new("share"))
+        .default_pos(egui::pos2(372.0, 16.0))
+        .show(ctx, |ui| {
+            panel_frame().show(ui, |ui| {
+                ui.set_width(300.0);
+                ui.horizontal(|ui| {
+                    ui.label(text("Share", HEAD_SIZE, WHITE));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if hud_btn(ui, "X", false, 22.0).clicked() { a.show_share = false; }
+                    });
+                });
+                ui.label(text("This scene as a code (or link, in the browser)", SMALL_SIZE, MUTED));
+                code_box(ui, &mut a.share_code, false);
+                ui.horizontal(|ui| {
+                    if hud_btn(ui, "COPY AGAIN", false, 0.0).clicked() { out.share = true; }
+                    ui.label(text(&a.share_note, SMALL_SIZE, MUTED));
+                });
+                ui.add_space(8.0);
+                ui.label(text("Load // paste a code or link", SMALL_SIZE, MUTED));
+                code_box(ui, &mut a.paste, true);
+                if hud_btn(ui, "LOAD", false, ui.available_width()).clicked() { out.load_code = true; }
+            });
+        });
+}
+
+/// Monospace text box in the panel style; `editable` false still selects.
+fn code_box(ui: &mut egui::Ui, s: &mut String, editable: bool) {
+    let mut view = s.clone();
+    let te = egui::TextEdit::multiline(if editable { s } else { &mut view })
+        .font(font(SMALL_SIZE))
+        .desired_rows(3)
+        .desired_width(f32::INFINITY);
+    egui::ScrollArea::vertical().id_salt(editable).max_height(70.0).show(ui, |ui| { ui.add(te); });
+}
+
+/// Phase portrait (θ, ω) of one body, or its Poincaré section.
+fn draw_phase_panel(ctx: &egui::Context, a: &mut Analysis, world: &World) {
+    let screen = ctx.screen_rect();
+    a.phase.ensure_bodies(world);
+    egui::Area::new(egui::Id::new("phase"))
+        .default_pos(egui::pos2(16.0, (screen.height() - 360.0).max(16.0)))
+        .show(ctx, |ui| {
+            panel_frame().show(ui, |ui| {
+                ui.set_width(300.0);
+                ui.horizontal(|ui| {
+                    ui.label(text("Phase space", HEAD_SIZE, WHITE));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if hud_btn(ui, "X", false, 22.0).clicked() { a.show_phase = false; }
+                    });
+                });
+                let p = &mut a.phase;
+                ui.horizontal(|ui| {
+                    for (mode, lbl) in [(PlotMode::Phase, "TRAJECTORY"), (PlotMode::Poincare, "POINCARE")] {
+                        if hud_btn(ui, lbl, p.mode == mode, 0.0).clicked() && p.mode != mode {
+                            p.mode = mode;
+                            p.clear();
+                        }
+                    }
+                    if hud_btn(ui, "CLEAR", false, 0.0).clicked() { p.clear(); }
+                });
+                let free = free_bodies(world);
+                if let Some(b) = body_picker(ui, "BODY", p.body, &free, &world.bodies) {
+                    p.body = Some(b);
+                    p.clear();
+                }
+                if p.mode == PlotMode::Poincare {
+                    if let Some(b) = body_picker(ui, "SECTION", p.section, &free, &world.bodies) {
+                        p.section = Some(b);
+                        p.clear();
+                    }
+                    ui.label(text("A dot each time the section body's angle passes 0", SMALL_SIZE, MUTED));
+                }
+
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 210.0), Sense::hover());
+                let painter = ui.painter_at(rect);
+                painter.rect_stroke(rect, Rounding::ZERO, Stroke::new(1.0_f32, Color32::from_gray(70)));
+                let c = rect.center();
+                painter.line_segment([egui::pos2(rect.left(), c.y), egui::pos2(rect.right(), c.y)], Stroke::new(1.0_f32, Color32::from_gray(40)));
+                painter.line_segment([egui::pos2(c.x, rect.top()), egui::pos2(c.x, rect.bottom())], Stroke::new(1.0_f32, Color32::from_gray(40)));
+                let w_max = p.w_max * 1.1;
+                let to_screen = |(t, w): (f32, f32)| egui::pos2(
+                    c.x + t / std::f32::consts::PI * rect.width() * 0.5,
+                    c.y - w / w_max * rect.height() * 0.5,
+                );
+                // Trajectory: fading polyline, broken where θ wraps.
+                let n = p.trail.len();
+                for (k, (a0, a1)) in p.trail.iter().zip(p.trail.iter().skip(1)).enumerate() {
+                    if (a1.0 - a0.0).abs() > std::f32::consts::PI { continue; }
+                    let f = (k + 1) as f32 / n as f32;
+                    let col = if p.mode == PlotMode::Phase {
+                        Color32::from_white_alpha((40.0 + 215.0 * f) as u8)
+                    } else {
+                        Color32::from_white_alpha((12.0 + 30.0 * f) as u8)
+                    };
+                    painter.line_segment([to_screen(*a0), to_screen(*a1)], Stroke::new(1.0_f32, col));
+                }
+                for &d in &p.dots {
+                    painter.circle_filled(to_screen(d), 1.2, RED);
+                }
+                if let Some(&last) = p.trail.back() {
+                    painter.circle_filled(to_screen(last), 3.0, WHITE);
+                }
+                painter.text(rect.left_top() + egui::vec2(4.0, 2.0), Align2::LEFT_TOP,
+                    format!("OMEGA {:+.1}", w_max), font(SMALL_SIZE), MUTED);
+                painter.text(rect.right_bottom() - egui::vec2(4.0, 2.0), Align2::RIGHT_BOTTOM,
+                    "ANGLE -PI..PI", font(SMALL_SIZE), MUTED);
+                if p.mode == PlotMode::Poincare {
+                    painter.text(rect.right_top() + egui::vec2(-4.0, 2.0), Align2::RIGHT_TOP,
+                        format!("{} DOTS", p.dots.len()), font(SMALL_SIZE), MUTED);
+                }
+            });
+        });
+}
+
+/// `LABEL < Disk 3 >`, cycling through `options`. Returns a new choice.
+fn body_picker(ui: &mut egui::Ui, label: &str, current: Option<usize>, options: &[usize], bodies: &[crate::sim::body::Body]) -> Option<usize> {
+    let mut pick = None;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(58.0, 18.0), Sense::hover());
+        ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, label, font(BODY_SIZE), WHITE);
+        let pos = current.and_then(|c| options.iter().position(|&o| o == c));
+        if !options.is_empty() {
+            let k = pos.unwrap_or(0);
+            if hud_btn(ui, "<", false, 24.0).clicked() { pick = Some(options[(k + options.len() - 1) % options.len()]); }
+            ui.label(text(current.map_or("None".to_owned(), |c| body_name(bodies, c)), BODY_SIZE, WHITE));
+            if hud_btn(ui, ">", false, 24.0).clicked() { pick = Some(options[(k + 1) % options.len()]); }
+        } else {
+            ui.label(text("No free bodies", BODY_SIZE, MUTED));
+        }
+    });
+    pick
+}
+
+/// Butterfly mode: divergence of the ghost and the Lyapunov estimate.
+fn draw_chaos_panel(ctx: &egui::Context, a: &mut Analysis, out: &mut HudOutput) {
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("chaos"))
+        .default_pos(egui::pos2(332.0, (screen.height() - 300.0).max(16.0)))
+        .show(ctx, |ui| {
+            panel_frame().show(ui, |ui| {
+                ui.set_width(280.0);
+                ui.horizontal(|ui| {
+                    ui.label(text("Butterfly", HEAD_SIZE, WHITE));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if hud_btn(ui, "X", false, 22.0).clicked() { out.toggle_chaos = true; }
+                        if hud_btn(ui, "RESEED", false, 0.0).clicked() { out.reseed_chaos = true; }
+                    });
+                });
+                let Some(bf) = &a.butterfly else {
+                    ui.label(text("Starts when the simulation runs", SMALL_SIZE, MUTED));
+                    return;
+                };
+                ui.label(text("Red ghost started 1E-9 away in velocity", SMALL_SIZE, MUTED));
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 120.0), Sense::hover());
+                let painter = ui.painter_at(rect);
+                painter.rect_stroke(rect, Rounding::ZERO, Stroke::new(1.0_f32, Color32::from_gray(70)));
+                // log10 distance from -10 to +1 against time.
+                let (lo, hi) = (-10.0f64, 1.0f64);
+                for g in [-8.0, -6.0, -4.0, -2.0, 0.0] {
+                    let y = rect.bottom() - ((g - lo) / (hi - lo)) as f32 * rect.height();
+                    painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], Stroke::new(1.0_f32, Color32::from_gray(35)));
+                }
+                if let (Some(&(t0, _)), Some(&(t1, _))) = (bf.history.front(), bf.history.back()) {
+                    let span = (t1 - t0).max(1e-6);
+                    let pts: Vec<egui::Pos2> = bf.history.iter().map(|&(t, l)| egui::pos2(
+                        rect.left() + ((t - t0) / span) as f32 * rect.width(),
+                        rect.bottom() - ((l.clamp(lo, hi) - lo) / (hi - lo)) as f32 * rect.height(),
+                    )).collect();
+                    painter.add(egui::Shape::line(pts, Stroke::new(1.5_f32, RED)));
+                }
+                painter.text(rect.left_top() + egui::vec2(4.0, 2.0), Align2::LEFT_TOP, "LOG10 DISTANCE", font(SMALL_SIZE), MUTED);
+                let d = bf.history.back().map_or(f64::NAN, |&(_, l)| l);
+                ui.label(text(format!("Distance = 1E{d:.1}"), BODY_SIZE, WHITE));
+                match bf.lyapunov {
+                    Some(l) => ui.label(text(format!("Lyapunov = {l:.2} /S"), BODY_SIZE, WHITE)),
+                    None => ui.label(text("Lyapunov = measuring...", BODY_SIZE, MUTED)),
+                };
+                let note = if bf.saturated() {
+                    "Fully diverged // estimate frozen"
+                } else if bf.lyapunov.is_some_and(|l| l < 0.05) {
+                    "Not growing // regular motion"
+                } else {
+                    "Slope of log distance over time"
+                };
+                ui.label(text(note, SMALL_SIZE, MUTED));
+            });
+        });
 }
 
 // ── Connections inspector ─────────────────────────────────────────────────────
@@ -594,6 +903,17 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
             let o = other(sj.rider, sj.rail);
             let what = if sj.rail == body_idx { "Carries" } else { "Slides on" };
             (format!("{what} > {}", body_name(bodies, o)), LinkHover::Body(o))
+        } else if let Some(g) = any.downcast_ref::<GearJoint>() {
+            let o = other(g.body_a, g.body_b);
+            let what = if g.kind == GearKind::Mesh { "Gear" } else { "Belt" };
+            (format!("{what} > {}", body_name(bodies, o)), LinkHover::Body(o))
+        } else if let Some(r) = any.downcast_ref::<Rope>() {
+            if r.pulley == Some(body_idx) {
+                (format!("Pulley for {} + {}", body_name(bodies, r.body_a), body_name(bodies, r.body_b)), LinkHover::Body(r.body_a))
+            } else {
+                let o = other(r.body_a, r.body_b);
+                (format!("Rope > {}", body_name(bodies, o)), LinkHover::Body(o))
+            }
         } else {
             ("Constraint".to_owned(), LinkHover::Body(body_idx))
         };
@@ -620,6 +940,24 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
             } else if let Some(sj) = any.downcast_mut::<SliderJoint>() {
                 toggle_row(ui, "LOCK ROT", &mut sj.lock_rotation);
                 ui.label(text("Rides the rail between its end stops", SMALL_SIZE, MUTED));
+            } else if let Some(g) = any.downcast_mut::<GearJoint>() {
+                ui.horizontal(|ui| {
+                    for (kind, lbl) in [(GearKind::Mesh, "MESH"), (GearKind::Belt, "BELT")] {
+                        if hud_btn(ui, lbl, g.kind == kind, 0.0).clicked() && g.kind != kind {
+                            g.kind = kind;
+                            g.rebase(bodies);
+                        }
+                    }
+                });
+                let r = g.ratio(bodies);
+                let (wa, wb) = (body_name(bodies, g.body_a), body_name(bodies, g.body_b));
+                ui.label(text(format!("{wb} turns {:.2}x {wa}{}", r.abs(), if r < 0.0 { ", reversed" } else { "" }), SMALL_SIZE, MUTED));
+            } else if let Some(r) = any.downcast_mut::<Rope>() {
+                slider_row(ui, "LENGTH", &mut r.length, 0.05, 12.0);
+                if r.pulley.is_some() {
+                    toggle_row(ui, "GRIPS PULLEY", &mut r.grip);
+                }
+                ui.label(text("Pulls, never pushes", SMALL_SIZE, MUTED));
             } else if any.is::<RollingContact>() || any.is::<RollingOnRod>() {
                 ui.label(text("No slip // rotation locked to travel", SMALL_SIZE, MUTED));
             } else {
@@ -642,6 +980,23 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
                 ui.label(text("Drive torque minus drag x spin", SMALL_SIZE, MUTED));
             });
             if delete { remove_force = Some(fi); }
+            continue;
+        }
+        if let Some(t) = f.as_any_mut().downcast_mut::<TorsionSpring>() {
+            count += 1;
+            let o = other(t.body_a, t.body_b);
+            let title = format!("Torsion > {}", body_name(bodies, o));
+            let mut rest = t.rest.to_degrees();
+            let (delete, hovered) = link_card(ui, &title, |ui| {
+                slider_row(ui, "STIFF", &mut t.stiffness, 0.5, 200.0);
+                slider_row(ui, "DAMP",  &mut t.damping,   0.0, 10.0);
+                slider_row(ui, "REST",  &mut rest, -180.0, 180.0);
+                ui.label(text("Springs the relative angle", SMALL_SIZE, MUTED));
+            });
+            // Only write back a real change: deg → rad → deg isn't exact.
+            if rest != t.rest.to_degrees() { t.rest = rest.to_radians(); }
+            if delete { remove_force = Some(fi); }
+            if hovered { hover = Some(LinkHover::Body(o)); }
             continue;
         }
         let Some(sd) = f.as_any_mut().downcast_mut::<SpringDamper>() else { continue };
@@ -732,6 +1087,12 @@ fn hud_btn(ui: &mut egui::Ui, label: &str, active: bool, min_width: f32) -> egui
     styled_btn(ui, label, active, min_width, WHITE)
 }
 
+/// Button that greys out when there's nothing to do.
+fn dim_btn(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    let r = styled_btn(ui, label, false, 0.0, if enabled { WHITE } else { Color32::from_gray(70) });
+    if enabled { r } else { r.on_hover_text("") }
+}
+
 fn danger_btn(ui: &mut egui::Ui, label: &str, min_width: f32) -> egui::Response {
     styled_btn(ui, label, false, min_width, RED)
 }
@@ -788,5 +1149,67 @@ fn toggle_row(ui: &mut egui::Ui, label: &str, value: &mut bool) {
     let lbl = format!("[{}] {label}", if *value { "X" } else { " " });
     if hud_btn(ui, &lbl, *value, 0.0).clicked() {
         *value = !*value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::Butterfly;
+    use crate::scenes::SCENES;
+    use crate::sim::forces::MouseSpringData;
+    use std::sync::{Arc, Mutex};
+
+    /// Lay out every panel, in every editor mode that has its own UI, for
+    /// each scene, inspecting every body (so every connection card shows).
+    #[test]
+    fn panels_lay_out() {
+        let ctx = egui::Context::default();
+        install_style(&ctx);
+        let mouse = Arc::new(Mutex::new(MouseSpringData::default()));
+        for def in SCENES {
+            let mut world = (def.build)();
+            let mut editor = Editor { active: true, ..Default::default() };
+            let mut a = Analysis { show_phase: true, show_chaos: true, show_share: true, show_forces: true, ..Default::default() };
+            a.share_code = "psim1:abc".into();
+            for _ in 0..30 {
+                world.step(1.0 / 240.0);
+                a.timeline.record(&world, 1.0 / 240.0);
+                a.phase.ensure_bodies(&world);
+                a.phase.after_frame(&world);
+            }
+            let mut bf = Butterfly::seed(&world, &mouse);
+            bf.sample(&world, 0.01);
+            a.butterfly = Some(bf);
+            let metrics = Metrics { fps: 60.0, sub_steps: 10, kinetic_energy: 1.0, potential_energy: 2.0, constraint_error: 1e-6, running: true };
+            let history = History::default();
+            let mut modes = vec![EditorMode::Idle, EditorMode::PlacingBody];
+            if world.bodies.len() >= 2 {
+                modes.push(EditorMode::BothSelected { body_a: 0, attach_a: glam::Vec2::ZERO, body_b: 1, attach_b: glam::Vec2::ONE });
+                modes.push(EditorMode::PulleyPending { body_a: 0, attach_a: glam::Vec2::ZERO, body_b: 1, attach_b: glam::Vec2::ONE });
+            }
+            for i in 0..world.bodies.len() { modes.push(EditorMode::Inspecting { body_idx: i }); }
+            for mode in modes {
+                if let EditorMode::Inspecting { body_idx } = mode {
+                    editor.body_edit = Some(crate::editor::BodyEdit::from_body(&world.bodies[body_idx]));
+                    editor.inspect_shape = Some("Rod".into());
+                }
+                editor.mode = mode;
+                for active in [true, false] {
+                    editor.active = active;
+                    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                        let mut out = draw_main_panel(ctx, &metrics, &history, 0, SCENES.len(), def.name, def.description, &mut editor, &mut a);
+                        if editor.active {
+                            draw_editor_panel(ctx, &mut editor, &mut world, UndoState::default(), &mut out);
+                        } else {
+                            draw_timeline(ctx, &mut a, &mut out);
+                        }
+                        draw_share_panel(ctx, &mut a, &mut out);
+                        draw_phase_panel(ctx, &mut a, &world);
+                        draw_chaos_panel(ctx, &mut a, &mut out);
+                    });
+                }
+            }
+        }
     }
 }

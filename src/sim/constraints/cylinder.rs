@@ -250,6 +250,19 @@ impl Constraint for Cylinder {
         }
     }
 
+    fn save_state(&self, out: &mut Vec<f64>) {
+        let stroke = [Stroke::Intake, Stroke::Compression, Stroke::Power, Stroke::Exhaust]
+            .iter().position(|&s| s == self.stroke).unwrap_or(1);
+        out.extend([stroke as f64, self.h_ref, self.p_ref, self.h_turn, self.h_ext, self.last_len]);
+    }
+
+    fn load_state(&mut self, input: &mut &[f64]) {
+        let Some((v, rest)) = input.split_first_chunk::<6>() else { return };
+        self.stroke = [Stroke::Intake, Stroke::Compression, Stroke::Power, Stroke::Exhaust][(v[0] as usize).min(3)];
+        [self.h_ref, self.p_ref, self.h_turn, self.h_ext, self.last_len] = [v[1], v[2], v[3], v[4], v[5]];
+        *input = rest;
+    }
+
     fn rebase(&mut self, bodies: &[Body]) {
         self.angle0 = bodies[self.piston].angle - bodies[self.barrel].angle;
         // The editor may have moved the piston: restart the current stroke

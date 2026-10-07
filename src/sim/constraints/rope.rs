@@ -40,7 +40,6 @@ pub struct Rope {
 /// One strand: from the pulley's tangent point `t` to the end point.
 struct Strand {
     end: Attach,
-    t: DVec2,
     /// Unit direction tangent point → end.
     u: DVec2,
     len: f64,
@@ -54,8 +53,6 @@ pub struct RopePath {
     pub b: Vec2,
     /// Pulley centre, radius and the arc the rope lies on (start, sweep).
     pub over: Option<(Vec2, f32, f32, f32)>,
-    pub ta: Vec2,
-    pub tb: Vec2,
     pub slack: bool,
 }
 
@@ -117,14 +114,24 @@ impl Rope {
         let mk = |end: Attach, t: DVec2, phi: f64| {
             let s = end.p - t;
             let len = s.length();
-            Strand { end, t, u: if len > 1e-12 { s / len } else { DVec2::ZERO }, len, phi }
+            Strand { end, u: if len > 1e-12 { s / len } else { DVec2::ZERO }, len, phi }
         };
         Some((mk(ea, ta, pha), mk(eb, tb, phb), r))
     }
 
-    /// Arc the rope covers on the pulley, from a's tangent point to b's.
+    /// Arc the rope covers on the pulley, from a's tangent point to b's,
+    /// as an angle in [0, 2π). Whole extra turns are `turns`' job.
     fn arc(&self, pha: f64, phb: f64) -> f64 {
         (self.wrap * (phb - pha)).rem_euclid(TAU)
+    }
+
+    /// Length over the pulley with the arc unwrapped by whole turns to the
+    /// count nearest the rope's length, so a rope wound round the pulley (a
+    /// mass swinging over the top) doesn't see its arc jump by 2π.
+    fn wrapped_length(&self, sa: &Strand, sb: &Strand, r: f64) -> f64 {
+        let open = sa.len + sb.len + r * self.arc(sa.phi, sb.phi);
+        let turns = ((self.length as f64 - open) / (TAU * r)).round();
+        open + turns * TAU * r
     }
 
     /// Length of the rope's path at the current pose.
@@ -132,7 +139,7 @@ impl Rope {
         let pa = bodies[self.body_a].world_point_d(self.local_a.as_dvec2());
         let pb = bodies[self.body_b].world_point_d(self.local_b.as_dvec2());
         match self.pulley.and_then(|p| self.strands(bodies, p)) {
-            Some((sa, sb, r)) => sa.len + sb.len + r * self.arc(sa.phi, sb.phi),
+            Some((sa, sb, r)) => self.wrapped_length(&sa, &sb, r),
             None => (pb - pa).length(),
         }
     }
@@ -145,11 +152,11 @@ impl Rope {
             Some((p, (sa, sb, r))) => {
                 let sweep = self.wrap * self.arc(sa.phi, sb.phi);
                 RopePath {
-                    a: pa, b: pb, ta: sa.t.as_vec2(), tb: sb.t.as_vec2(), slack,
+                    a: pa, b: pb, slack,
                     over: Some((bodies[p].pos32(), r as f32, sa.phi as f32, sweep as f32)),
                 }
             }
-            None => RopePath { a: pa, b: pb, ta: pa, tb: pb, over: None, slack },
+            None => RopePath { a: pa, b: pb, over: None, slack },
         }
     }
 
@@ -205,7 +212,7 @@ impl Constraint for Rope {
         };
 
         let Some((sa, sb, r)) = self.strands(bodies, p) else { return };
-        let c = sa.len + sb.len + r * self.arc(sa.phi, sb.phi) - rest;
+        let c = self.wrapped_length(&sa, &sb, r) - rest;
         if c < -SLACK_TOL || sa.len < 1e-9 || sb.len < 1e-9 { return; }
         let pul = &bodies[p];
         let grip = self.gripping(bodies);

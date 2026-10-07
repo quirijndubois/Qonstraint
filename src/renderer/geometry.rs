@@ -45,6 +45,14 @@ impl GeometryBuilder {
         self.indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
     }
 
+    /// Filled quadrilateral (corners in order).
+    pub fn draw_quad(&mut self, a: Vec2, b: Vec2, c: Vec2, d: Vec2, color: [f32; 4]) {
+        self.push_quad(
+            Vertex::new(a, color), Vertex::new(b, color),
+            Vertex::new(c, color), Vertex::new(d, color),
+        );
+    }
+
     /// Filled diamond: tips at `c ± along` and `c ± across`.
     pub fn draw_diamond(&mut self, c: Vec2, along: Vec2, across: Vec2, color: [f32; 4]) {
         self.push_quad(

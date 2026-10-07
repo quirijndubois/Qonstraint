@@ -1,6 +1,7 @@
 pub mod body;
 pub mod constraint;
 pub mod constraints;
+pub mod contact;
 pub mod force;
 pub mod forces;
 pub mod solver;

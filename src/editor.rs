@@ -2,8 +2,12 @@ use glam::Vec2;
 
 use crate::sim::{
     body::{Body, BodyShape, disk_inertia, rod_inertia},
-    constraints::{Cylinder, DistanceConstraint, PinJoint, PinWorld, RollingContact, RollingOnRod, SliderJoint},
-    forces::spring::SpringDamper,
+    constraint::Constraint,
+    constraints::{
+        Cylinder, DistanceConstraint, GearJoint, GearKind, PinJoint, PinWorld, RollingContact,
+        RollingOnRod, Rope, SliderJoint,
+    },
+    forces::{spring::SpringDamper, TorsionSpring},
     world::{Integrator, World},
 };
 
@@ -24,11 +28,12 @@ pub struct BodyProps {
     pub half_len: f32, // for Rod
     pub half_width: f32, // for Rod
     pub fixed:    bool,
+    pub collide:  bool,
 }
 
 impl Default for BodyProps {
     fn default() -> Self {
-        Self { template: BodyTemplate::Disk, mass: 1.0, radius: 0.35, half_len: 0.5, half_width: 0.06, fixed: false }
+        Self { template: BodyTemplate::Disk, mass: 1.0, radius: 0.35, half_len: 0.5, half_width: 0.06, fixed: false, collide: false }
     }
 }
 
@@ -38,6 +43,7 @@ impl Default for BodyProps {
 pub struct BodyEdit {
     pub mass:     f32,
     pub fixed:    bool,
+    pub collide:  bool,
     pub radius:   f32,   // Disk only
     pub half_len: f32,   // Rod only
     pub half_width: f32, // Rod only
@@ -139,12 +145,21 @@ pub fn set_shape(world: &mut World, idx: usize, shape: BodyShape) {
         scale_attachments(world, idx, scale);
     }
     let body = &mut world.bodies[idx];
+    let resized_disk = matches!((&body.shape, &shape), (BodyShape::Disk { radius: a }, BodyShape::Disk { radius: b }) if a != b);
     body.inertia = match shape {
         BodyShape::Disk { radius } => disk_inertia(body.mass, radius),
         BodyShape::Rod { half_len, .. } => rod_inertia(body.mass, half_len),
         BodyShape::Point => body.inertia,
     };
     body.shape = shape;
+    if resized_disk {
+        // A rope over a resized pulley keeps its strands as they are.
+        for c in world.constraints.iter_mut() {
+            if let Some(r) = c.as_any_mut().downcast_mut::<Rope>() {
+                if r.pulley == Some(idx) { r.length = r.current_length(&world.bodies) as f32; }
+            }
+        }
+    }
 }
 
 /// Multiply every body-local attachment point on `idx` by `s` (per axis).
@@ -166,12 +181,18 @@ fn scale_attachments(world: &mut World, idx: usize, s: Vec2) {
             scale(cy.piston, &mut cy.local);
             // The crown sits on the piston's face across the bore axis.
             if cy.piston == idx { cy.crown *= s.y; }
+        } else if let Some(r) = any.downcast_mut::<Rope>() {
+            scale(r.body_a, &mut r.local_a);
+            scale(r.body_b, &mut r.local_b);
         }
     }
     for f in world.forces.iter_mut() {
-        if let Some(sd) = f.as_any_mut().downcast_mut::<SpringDamper>() {
+        let any = f.as_any_mut();
+        if let Some(sd) = any.downcast_mut::<SpringDamper>() {
             scale(sd.body_a, &mut sd.local_a);
             scale(sd.body_b, &mut sd.local_b);
+        } else if let Some(t) = any.downcast_mut::<TorsionSpring>() {
+            scale(t.body_a, &mut t.local_a);
         }
     }
     for t in world.tracers.iter_mut() {
@@ -199,7 +220,7 @@ impl BodyEdit {
             BodyShape::Point                          => (0.35, 0.5, 0.06),
         };
         let angle = wrapped_degrees(body);
-        Self { mass: body.mass, fixed: body.fixed, radius, half_len, half_width, angle, angle_synced: angle }
+        Self { mass: body.mass, fixed: body.fixed, collide: body.collide, radius, half_len, half_width, angle, angle_synced: angle }
     }
 
     /// Apply edited values back to body `idx`, recalculating inertia; a
@@ -215,6 +236,7 @@ impl BodyEdit {
         self.angle_synced = self.angle;
         body.mass  = self.mass;
         body.fixed = self.fixed;
+        body.collide = self.collide;
         if self.fixed {
             // A fixed body isn't integrated, but constraints still read its
             // velocity; a leftover spin would drive whatever rolls on it.
@@ -241,6 +263,12 @@ pub enum ConstraintKind {
     Spring,
     Slider,
     Cylinder,
+    Gear,
+    Belt,
+    Rope,
+    /// A rope that runs over a pulley picked next (`EditorMode::PulleyPending`).
+    RopeOverPulley,
+    Torsion,
 }
 
 // ── Editor state machine ───────────────────────────────────────────────────────
@@ -267,6 +295,13 @@ pub enum EditorMode {
     PinWorldPending {
         body_idx:  usize,
         attach:    Vec2, // local attach on body
+    },
+    /// Two ends chosen for a rope; waiting for a click on the pulley disk.
+    PulleyPending {
+        body_a:   usize,
+        attach_a: Vec2,
+        body_b:   usize,
+        attach_b: Vec2,
     },
     /// Dragging a body
     Dragging {
@@ -347,6 +382,11 @@ pub struct Editor {
     pub pair_can_roll:       bool,
     /// The current BothSelected pair can slide (at least one is a rod).
     pub pair_can_slide:      bool,
+    /// The current BothSelected pair can gear (two disks).
+    pub pair_can_gear:       bool,
+    /// New torsion springs.
+    pub torsion_k:           f32,
+    pub torsion_d:           f32,
     /// What the connection row under the pointer links to, for scene highlighting.
     pub link_hover:          Option<LinkHover>,
 }
@@ -390,6 +430,9 @@ impl Default for Editor {
             time_scale:         1.0,
             pair_can_roll:      false,
             pair_can_slide:     false,
+            pair_can_gear:      false,
+            torsion_k:          20.0,
+            torsion_d:          0.5,
             link_hover:         None,
         }
     }
@@ -417,6 +460,7 @@ impl Editor {
                 let mut b = Body::new(world_pos, 0.0, bp.mass, inertia,
                                       BodyShape::Disk { radius: bp.radius });
                 if bp.fixed { b = b.fixed(); }
+                b.collide = bp.collide;
                 b
             }
             BodyTemplate::Rod => {
@@ -424,6 +468,7 @@ impl Editor {
                 let mut b = Body::new(world_pos, 0.0, bp.mass, inertia,
                                       BodyShape::Rod { half_len: bp.half_len, half_width: bp.half_width });
                 if bp.fixed { b = b.fixed(); }
+                b.collide = bp.collide;
                 b
             }
             BodyTemplate::Anchor => {
@@ -480,6 +525,27 @@ impl Editor {
                     add_slider(body_a, attach_a, b, attach_b, world, true);
                 }
             }
+            ConstraintKind::Gear | ConstraintKind::Belt => {
+                if let Some(b) = body_b {
+                    let kind = if kind == ConstraintKind::Gear { GearKind::Mesh } else { GearKind::Belt };
+                    if let Some(g) = GearJoint::new(body_a, b, kind, &world.bodies) {
+                        world.add_constraint(g);
+                    }
+                }
+            }
+            ConstraintKind::Rope | ConstraintKind::RopeOverPulley => {
+                if let Some(b) = body_b {
+                    let local_a = world_to_local(&world.bodies[body_a], attach_a);
+                    let local_b = world_to_local(&world.bodies[b], attach_b);
+                    world.add_constraint(Rope::new(body_a, local_a, b, local_b, &world.bodies));
+                }
+            }
+            ConstraintKind::Torsion => {
+                if let Some(b) = body_b {
+                    let local_a = world_to_local(&world.bodies[body_a], attach_a);
+                    world.add_force(TorsionSpring::new(body_a, b, local_a, self.torsion_k, self.torsion_d, &world.bodies));
+                }
+            }
             ConstraintKind::Spring => {
                 if let Some(b) = body_b {
                     let local_a = world_to_local(&world.bodies[body_a], attach_a);
@@ -527,6 +593,22 @@ impl Editor {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Add a rope from (a, attach_a) to (b, attach_b) over the disk `pulley`.
+/// False if it can't be routed (not a disk, or an end inside it).
+pub fn add_rope_over(a: usize, attach_a: Vec2, b: usize, attach_b: Vec2, pulley: usize, world: &mut World) -> bool {
+    let local_a = world_to_local(&world.bodies[a], attach_a);
+    let local_b = world_to_local(&world.bodies[b], attach_b);
+    match Rope::new(a, local_a, b, local_b, &world.bodies).over(pulley, &world.bodies) {
+        Some(r) => { world.add_constraint(r); true }
+        None => false,
+    }
+}
+
+/// Gears and belts join two disks.
+pub fn can_gear(a: &Body, b: &Body) -> bool {
+    is_disk(a) && is_disk(b)
+}
 
 fn disk_radius_of(body: &Body) -> Option<f32> {
     match body.shape {
@@ -675,9 +757,18 @@ pub fn connection_handles(world: &World, body_idx: usize) -> Vec<(HandleRef, Vec
         } else if let Some(dc) = any.downcast_ref::<DistanceConstraint>() {
             out.push((h(HandleEnd::A), b[dc.body_a].world_point(dc.local_a)));
             out.push((h(HandleEnd::B), b[dc.body_b].world_point(dc.local_b)));
+        } else if let Some(r) = any.downcast_ref::<Rope>() {
+            if r.body_a == body_idx { out.push((h(HandleEnd::A), b[r.body_a].world_point(r.local_a))); }
+            if r.body_b == body_idx { out.push((h(HandleEnd::B), b[r.body_b].world_point(r.local_b))); }
         }
     }
     for (idx, f) in world.forces.iter().enumerate() {
+        if let Some(t) = f.as_any().downcast_ref::<TorsionSpring>() {
+            if t.body_a == body_idx || t.body_b == body_idx {
+                out.push((HandleRef::Spring { idx, end: HandleEnd::A }, b[t.body_a].world_point(t.local_a)));
+            }
+            continue;
+        }
         let Some(sd) = f.as_any().downcast_ref::<SpringDamper>() else { continue };
         if sd.body_a != body_idx && sd.body_b != body_idx { continue; }
         out.push((HandleRef::Spring { idx, end: HandleEnd::A }, b[sd.body_a].world_point(sd.local_a)));
@@ -716,6 +807,14 @@ pub fn move_handle(world: &mut World, handle: HandleRef, p: Vec2) {
                 let pa = bodies[dc.body_a].world_point(dc.local_a);
                 let pb = bodies[dc.body_b].world_point(dc.local_b);
                 dc.rest_len = (pb - pa).length();
+            } else if let Some(r) = any.downcast_mut::<Rope>() {
+                // Like a distance rod, the rope stays taut at its new length.
+                match end {
+                    HandleEnd::A => r.local_a = world_to_local(&bodies[r.body_a], p),
+                    _            => r.local_b = world_to_local(&bodies[r.body_b], p),
+                }
+                r.length = r.current_length(bodies) as f32;
+                r.rebase(bodies);
             }
         }
         HandleRef::Tracer { idx } => {
@@ -724,6 +823,10 @@ pub fn move_handle(world: &mut World, handle: HandleRef, p: Vec2) {
         }
         HandleRef::Spring { idx, end } => {
             let Some(f) = world.forces.get_mut(idx) else { return };
+            if let Some(t) = f.as_any_mut().downcast_mut::<TorsionSpring>() {
+                t.local_a = world_to_local(&bodies[t.body_a], p);
+                return;
+            }
             let Some(sd) = f.as_any_mut().downcast_mut::<SpringDamper>() else { return };
             match end {
                 HandleEnd::A => sd.local_a = world_to_local(&bodies[sd.body_a], p),

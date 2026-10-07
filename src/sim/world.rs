@@ -1,6 +1,7 @@
 use glam::{DVec2, Vec2};
 use crate::sim::body::Body;
-use crate::sim::constraint::{Constraint, ConstraintEval};
+use crate::sim::constraint::{Constraint, ConstraintEval, Reaction};
+use crate::sim::contact::Contacts;
 use crate::sim::force::Force;
 use crate::sim::solver::WitkinSolver;
 use crate::sim::xpbd::{self, XpbdScratch};
@@ -34,6 +35,12 @@ pub struct World {
     pub forces: Vec<Box<dyn Force>>,
     pub tracers: Vec<Tracer>,
     pub integrator: Integrator,
+    /// Collisions between bodies with `collide` set, and their material.
+    pub contacts: Contacts,
+    /// When set, each step records the force every constraint applies
+    /// (`reactions`, indexed like `constraints`), for the force overlay.
+    pub record_reactions: bool,
+    pub reactions: Vec<Reaction>,
     /// Set when the configuration may violate the constraints (new world,
     /// editor changes); the next XPBD step settles positions first.
     needs_settle: bool,
@@ -50,6 +57,9 @@ impl World {
             forces: Vec::new(),
             tracers: Vec::new(),
             integrator: Integrator::default(),
+            contacts: Contacts::default(),
+            record_reactions: false,
+            reactions: Vec::new(),
             needs_settle: true,
             solver: WitkinSolver::default(),
             rk4: Rk4Scratch::default(),
@@ -79,21 +89,48 @@ impl World {
     /// (the editor), and settle any violation before the next step.
     pub fn rebase(&mut self) {
         for c in self.constraints.iter_mut() { c.rebase(&self.bodies); }
+        self.contacts.reset();
         self.needs_settle = true;
     }
 
     pub fn step(&mut self, dt: f32) {
         let dt = dt as f64;
+        self.contacts.prepare(&self.bodies, &self.constraints);
         match self.integrator {
             Integrator::Xpbd => {
                 if std::mem::take(&mut self.needs_settle) {
                     xpbd::settle(&mut self.bodies, &self.constraints, &mut self.xpbd);
                 }
-                xpbd::step(&mut self.bodies, &self.constraints, &self.forces, dt, &mut self.xpbd);
+                let rec = self.record_reactions.then_some(&mut self.reactions);
+                xpbd::step(&mut self.bodies, &self.constraints, &self.forces, &mut self.contacts, dt, &mut self.xpbd, rec);
             }
             Integrator::Rk4 => self.rk4_step(dt),
         }
         for c in self.constraints.iter_mut() { c.post_step(&self.bodies); }
+        self.contacts.post_step(&self.bodies, dt);
+    }
+
+    /// Dynamic state of every body (and any evolving constraint state), for
+    /// rewinding. Only valid for a world with the same structure.
+    pub fn save_state(&self, out: &mut Vec<f64>) {
+        out.clear();
+        for b in &self.bodies {
+            out.extend([b.pos.x, b.pos.y, b.angle, b.vel.x, b.vel.y, b.ang_vel]);
+        }
+        for c in &self.constraints { c.save_state(out); }
+    }
+
+    /// Put back a state from `save_state`. Contact stick state is dropped.
+    pub fn load_state(&mut self, state: &[f64]) {
+        let (body_part, mut rest) = state.split_at((self.bodies.len() * 6).min(state.len()));
+        for (b, v) in self.bodies.iter_mut().zip(body_part.chunks_exact(6)) {
+            b.pos = DVec2::new(v[0], v[1]);
+            b.angle = v[2];
+            b.vel = DVec2::new(v[3], v[4]);
+            b.ang_vel = v[5];
+        }
+        for c in self.constraints.iter_mut() { c.load_state(&mut rest); }
+        self.contacts.reset();
     }
 
     pub fn kinetic_energy(&self) -> f32 {
@@ -141,7 +178,11 @@ impl World {
             for b in self.bodies.iter_mut() { b.clear_accumulators(); }
             for f in &self.forces { f.apply(&mut self.bodies); }
             for c in &self.constraints { c.apply_forces(&mut self.bodies, dt); }
+            self.contacts.apply(&mut self.bodies, dt);
             self.solver.apply(&mut self.bodies, &self.constraints);
+            if stage == 0 && self.record_reactions {
+                self.solver.reactions(&self.constraints, &mut self.reactions);
+            }
 
             for ((b, s0), sum) in self.bodies.iter_mut().zip(&s.s0).zip(s.sum.iter_mut()) {
                 if b.fixed { continue; }

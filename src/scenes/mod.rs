@@ -4,9 +4,9 @@ use crate::sim::{
     body::{disk_inertia, rod_inertia, Body, BodyShape},
     constraints::{
         cylinder::{CylinderState, GasMode, Stroke}, slider::{COLLAR_HALF, STOP_W},
-        Cylinder, DistanceConstraint, PinJoint, PinWorld, SliderJoint,
+        Cylinder, DistanceConstraint, GearJoint, GearKind, PinJoint, PinWorld, Rope, SliderJoint,
     },
-    forces::spring::SpringDamper,
+    forces::{spring::SpringDamper, TorsionSpring},
     world::World,
 };
 
@@ -14,12 +14,20 @@ pub mod air_struts;
 pub mod coupled_pendulums;
 pub mod double_pendulum;
 pub mod elastic_pendulum;
+pub mod flexible_beam;
+pub mod gear_train;
+pub mod kapitza;
+pub mod peaucellier;
 pub mod planetary_pendulum;
 pub mod radial_engine;
 pub mod rocker_linkage;
 pub mod rolling_crane;
 pub mod sandbox;
+pub mod strandbeest;
+pub mod swinging_atwood;
 pub mod trammel;
+pub mod tumbler;
+pub mod watt_linkage;
 #[cfg(test)]
 mod bench;
 
@@ -102,6 +110,62 @@ pub static SCENES: &[SceneDef] = &[
         view_size:     [5.0, 4.6],
     },
     SceneDef {
+        name:          "Strandbeest",
+        description:   "Jansen's walking leg, mirrored on one crank: the feet trace flat-bottomed paths",
+        build:         strandbeest::build,
+        camera_center: [0.0, -0.1],
+        view_size:     [6.0, 4.6],
+    },
+    SceneDef {
+        name:          "Peaucellier-Lipkin",
+        description:   "A swinging crank and an inverting rhombus: P runs on an exact straight line",
+        build:         peaucellier::build,
+        camera_center: [0.0, 0.6],
+        view_size:     [6.0, 4.4],
+    },
+    SceneDef {
+        name:          "Watt's Linkage",
+        description:   "Two arms and a coupler: the midpoint bobs on a near-straight line, figure eight at the ends",
+        build:         watt_linkage::build,
+        camera_center: [0.0, 0.0],
+        view_size:     [5.6, 4.2],
+    },
+    SceneDef {
+        name:          "Kapitza's Pendulum",
+        description:   "Shaken fast enough from below, an upside-down pendulum stands up",
+        build:         kapitza::build,
+        camera_center: [0.0, -0.3],
+        view_size:     [4.0, 3.8],
+    },
+    SceneDef {
+        name:          "Gear Train",
+        description:   "Motor, 3:1 gears, 1:2 belt, then a crank-rocker tracing its coupler curve",
+        build:         gear_train::build,
+        camera_center: [0.0, 0.4],
+        view_size:     [6.8, 3.8],
+    },
+    SceneDef {
+        name:          "Swinging Atwood",
+        description:   "A rope over a pulley: counterweight on one end, a swinging mass on the other",
+        build:         swinging_atwood::build,
+        camera_center: [0.0, 0.5],
+        view_size:     [5.0, 4.4],
+    },
+    SceneDef {
+        name:          "Tumbler",
+        description:   "Collisions with friction: a paddle stirs disks and bars in a box",
+        build:         tumbler::build,
+        camera_center: [0.0, 0.0],
+        view_size:     [5.4, 3.9],
+    },
+    SceneDef {
+        name:          "Flexible Beam",
+        description:   "Rigid segments on torsion-sprung hinges: a cantilever that rings",
+        build:         flexible_beam::build,
+        camera_center: [0.0, 0.2],
+        view_size:     [5.6, 3.8],
+    },
+    SceneDef {
         name:          "Sandbox",
         description:   "Build your own simulation  ·  press E to edit",
         build:         sandbox::build,
@@ -130,6 +194,19 @@ pub(crate) fn rod_between(a: Vec2, b: Vec2, mass: f32, half_width: f32) -> (Body
 
 pub(crate) fn anchor(pos: Vec2) -> Body {
     Body::new(pos, 0.0, 1.0, 1.0, BodyShape::Point).fixed()
+}
+
+/// The two points at distance `r1` from `c1` and `r2` from `c2` (left and
+/// right of the direction c1 → c2), if the circles meet.
+pub(crate) fn circle_intersections(c1: Vec2, r1: f32, c2: Vec2, r2: f32) -> Option<(Vec2, Vec2)> {
+    let d = c2 - c1;
+    let l = d.length();
+    if l < 1e-6 || l > r1 + r2 || l < (r1 - r2).abs() { return None; }
+    let a = (r1 * r1 - r2 * r2 + l * l) / (2.0 * l);
+    let h = (r1 * r1 - a * a).max(0.0).sqrt();
+    let u = d / l;
+    let m = c1 + u * a;
+    Some((m + u.perp() * h, m - u.perp() * h))
 }
 
 /// Unit vector at angle `phi` measured from straight down (pendulum angle).
@@ -162,9 +239,12 @@ const CARRIAGE_ROUND: f32 = 0.03;
 /// `anchor_ref_y` decides mount direction: anchors above it hang from a
 /// ceiling, the rest stand on the floor. The app updates it live while
 /// editing and freezes it while simulating, so mounts never flip mid-run.
-pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, geo: &mut GeometryBuilder) {
+/// `tint` colours bodies by index (the force overlay); empty means white.
+pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], geo: &mut GeometryBuilder) {
     let bodies = &world.bodies;
     let n = bodies.len();
+    let fill = |i: usize| tint.get(i).copied().unwrap_or(WHITE);
+    let gears = gear_phases(world);
 
     let ceiling = |p: Vec2| anchor_ref_y.is_some_and(|y| p.y > y);
 
@@ -205,16 +285,34 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, geo: &mut GeometryBu
         draw_cylinder(geo, cy, &bodies[cy.barrel], cy.state(bodies));
     }
 
-    // 4. Disks
-    for b in bodies {
+    // 4. Disks, toothed where they mesh
+    for (i, b) in bodies.iter().enumerate() {
         if let BodyShape::Disk { radius } = b.shape {
-            outlined_circle(geo, b.pos32(), radius, 64);
+            let color = fill(i);
+            let body_r = match gears.get(i).copied().flatten() {
+                Some(phase) => {
+                    draw_teeth(geo, b.pos32(), radius, b.angle32() + phase, color);
+                    radius - TOOTH_DED
+                }
+                None => radius,
+            };
+            geo.draw_circle(b.pos32(), body_r + OUTLINE, 64, BG);
+            geo.draw_circle(b.pos32(), body_r, 64, color);
             let hub = (radius * 0.25).min(0.035);
             geo.draw_circle(b.pos32(), hub, 16, BG);
             // Off-centre dot so rotation is visible
             let (s, c) = b.angle32().sin_cos();
             let dot = b.pos32() + Vec2::new(c, s) * (radius * 0.55);
             geo.draw_circle(dot, (radius * 0.08).max(0.012), 12, BG);
+        }
+    }
+
+    // Belts over their pulleys
+    for c in &world.constraints {
+        if let Some(g) = c.as_any().downcast_ref::<GearJoint>() {
+            if g.kind == GearKind::Belt && g.body_a < n && g.body_b < n {
+                draw_belt(geo, &bodies[g.body_a], &bodies[g.body_b]);
+            }
         }
     }
 
@@ -226,7 +324,20 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, geo: &mut GeometryBu
         if let BodyShape::Rod { half_len, half_width } = b.shape {
             let (s, c) = b.angle32().sin_cos();
             let d = Vec2::new(c, s) * half_len;
-            outlined_rod(geo, b.pos32() - d, b.pos32() + d, 2.0 * half_width);
+            let w = 2.0 * half_width;
+            geo.draw_rod(b.pos32() - d, b.pos32() + d, w + 2.0 * OUTLINE, BG);
+            geo.draw_rod(b.pos32() - d, b.pos32() + d, w, fill(i));
+        }
+    }
+
+    // Ropes, over their pulleys
+    for c in &world.constraints {
+        if let Some(r) = c.as_any().downcast_ref::<Rope>() {
+            if r.body_a < n && r.body_b < n && r.pulley.is_none_or(|p| p < n) {
+                draw_rope(geo, r, bodies);
+                pins.push(bodies[r.body_a].world_point(r.local_a));
+                pins.push(bodies[r.body_b].world_point(r.local_b));
+            }
         }
     }
 
@@ -299,10 +410,188 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, geo: &mut GeometryBu
         }
     }
 
+    // Torsion springs: a spiral that winds up with the twist
+    for f in &world.forces {
+        if let Some(t) = f.as_any().downcast_ref::<TorsionSpring>() {
+            if t.body_a < n && t.body_b < n {
+                let p = bodies[t.body_a].world_point(t.local_a);
+                draw_torsion(geo, p, bodies[t.body_a].angle32(), t.twist(bodies) as f32);
+                pins.push(p);
+            }
+        }
+    }
+
     // 9. Pins on top
     for p in pins {
         draw_pin(geo, p);
     }
+}
+
+// ── Gears, belts, ropes, torsion springs ─────────────────────────────────────
+
+/// Tooth pitch along the rim, addendum and dedendum.
+const TOOTH_PITCH: f32 = 0.11;
+const TOOTH_ADD:   f32 = 0.035;
+const TOOTH_DED:   f32 = 0.035;
+const BELT_W:      f32 = 0.035;
+const ROPE_W:      f32 = 0.022;
+
+fn tooth_count(radius: f32) -> u32 {
+    ((std::f32::consts::TAU * radius / TOOTH_PITCH).round() as u32).max(6)
+}
+
+/// Phase offset of the teeth on every disk that meshes, so meshing pairs
+/// interleave: each gear's teeth sit in its partner's gaps at the contact.
+/// Worked out along each train from its first gear.
+fn gear_phases(world: &World) -> Vec<Option<f32>> {
+    let bodies = &world.bodies;
+    let mut phase: Vec<Option<f32>> = vec![None; bodies.len()];
+    for c in &world.constraints {
+        let Some(g) = c.as_any().downcast_ref::<GearJoint>() else { continue };
+        if g.kind != GearKind::Mesh || g.body_a >= bodies.len() || g.body_b >= bodies.len() { continue; }
+        let (a, b) = (g.body_a, g.body_b);
+        let (Some(ra), Some(rb)) = (disk_r(&bodies[a]), disk_r(&bodies[b])) else { continue };
+        let (pa, pb) = (phase[a], phase[b]);
+        // Orient the pair so `from` already has a phase if either does.
+        let (from, to, rf, rt) = if pa.is_none() && pb.is_some() { (b, a, rb, ra) } else { (a, b, ra, rb) };
+        let pf = *phase[from].get_or_insert(0.0);
+        if phase[to].is_some() { continue; }
+        let d = bodies[to].pos32() - bodies[from].pos32();
+        let psi = d.y.atan2(d.x);
+        let (nf, nt) = (tooth_count(rf) as f32, tooth_count(rt) as f32);
+        let tau = std::f32::consts::TAU;
+        // Fraction of a tooth pitch `from`'s nearest tooth is from the contact line.
+        let ff = ((psi - bodies[from].angle32() - pf) * nf / tau).rem_euclid(1.0);
+        // Mirror it on `to` (they turn opposite ways), half a pitch over.
+        let ft = 0.5 - ff;
+        phase[to] = Some(psi + std::f32::consts::PI - bodies[to].angle32() - ft * tau / nt);
+        let _ = rt;
+    }
+    phase
+}
+
+fn disk_r(b: &Body) -> Option<f32> {
+    match b.shape { BodyShape::Disk { radius } => Some(radius), _ => None }
+}
+
+/// Trapezoid teeth around the pitch circle `r`, starting at angle `start`.
+fn draw_teeth(geo: &mut GeometryBuilder, c: Vec2, r: f32, start: f32, color: [f32; 4]) {
+    let n = tooth_count(r);
+    let step = std::f32::consts::TAU / n as f32;
+    let (root, tip) = (r - TOOTH_DED, r + TOOTH_ADD);
+    for (grow, col) in [(OUTLINE, BG), (0.0, color)] {
+        for k in 0..n {
+            let a = start + k as f32 * step;
+            let dir = Vec2::new(a.cos(), a.sin());
+            let side = dir.perp();
+            // Wider at the root than the tip.
+            let (w_root, w_tip) = (step * r * 0.30 + grow, step * r * 0.18 + grow);
+            let p0 = c + dir * root;
+            let p1 = c + dir * (tip + grow);
+            geo.draw_quad(p0 - side * w_root, p0 + side * w_root, p1 + side * w_tip, p1 - side * w_tip, col);
+        }
+    }
+}
+
+/// Points along an arc (inclusive of both ends).
+fn arc_points(c: Vec2, r: f32, start: f32, sweep: f32, out: &mut Vec<Vec2>) {
+    let segs = ((sweep.abs() * r / 0.03).ceil() as usize).clamp(2, 128);
+    for k in 0..=segs {
+        let a = start + sweep * k as f32 / segs as f32;
+        out.push(c + Vec2::new(a.cos(), a.sin()) * r);
+    }
+}
+
+/// Thick polyline with round joins; `closed` joins the ends.
+fn polyline(geo: &mut GeometryBuilder, pts: &[Vec2], w: f32, color: [f32; 4], closed: bool) {
+    let n = pts.len();
+    if n < 2 { return; }
+    let segs = if closed { n } else { n - 1 };
+    for k in 0..segs {
+        let (a, b) = (pts[k], pts[(k + 1) % n]);
+        geo.draw_line(a, b, w, color);
+        geo.draw_circle(b, w * 0.5, 8, color);
+    }
+}
+
+/// Open belt around two pulleys, with marks that travel with it.
+fn draw_belt(geo: &mut GeometryBuilder, a: &Body, b: &Body) {
+    let (Some(ra), Some(rb)) = (disk_r(a), disk_r(b)) else { return };
+    let (ca, cb) = (a.pos32(), b.pos32());
+    let d = cb - ca;
+    let len = d.length();
+    let (ra, rb) = (ra + BELT_W * 0.5, rb + BELT_W * 0.5);
+    if len <= (ra - rb).abs() + 1e-4 { return; }
+    let base = d.y.atan2(d.x);
+    let gamma = ((ra - rb) / len).clamp(-1.0, 1.0).acos();
+    let tau = std::f32::consts::TAU;
+    // Wrapped arcs: round the back of a, and the front of b.
+    let mut pts = Vec::new();
+    arc_points(ca, ra, base + gamma, tau - 2.0 * gamma, &mut pts);
+    arc_points(cb, rb, base - gamma, 2.0 * gamma, &mut pts);
+    polyline(geo, &pts, BELT_W + 2.0 * OUTLINE, BG, true);
+    polyline(geo, &pts, BELT_W, WHITE, true);
+    // Marks every so often along the belt, carried round by pulley a.
+    let spacing = 0.16;
+    let mut offset = (a.angle32() * ra).rem_euclid(spacing);
+    let m = pts.len();
+    for k in 0..m {
+        let (p, q) = (pts[k], pts[(k + 1) % m]);
+        let seg = (q - p).length();
+        let dir = (q - p) / seg.max(1e-6);
+        while offset < seg {
+            let at = p + dir * offset;
+            geo.draw_line(at - dir * 0.012, at + dir * 0.012, BELT_W * 0.6, BG);
+            offset += spacing;
+        }
+        offset -= seg;
+    }
+}
+
+/// Rope as a thin line: straight (or sagging, when slack) between its ends,
+/// or two strands and the arc it lies on over a pulley.
+fn draw_rope(geo: &mut GeometryBuilder, r: &Rope, bodies: &[Body]) {
+    let path = r.path(bodies);
+    let mut pts = Vec::new();
+    match path.over {
+        Some((c, pr, start, sweep)) => {
+            pts.push(path.a);
+            arc_points(c, pr + ROPE_W * 0.5, start, sweep, &mut pts);
+            pts.push(path.b);
+        }
+        None => {
+            let (a, b) = (path.a, path.b);
+            let dist = (b - a).length();
+            let excess = (r.length - dist).max(0.0);
+            // A parabola of the same length hangs about √(3·d·excess/8) deep.
+            let sag = if path.slack { (3.0 * dist * excess / 8.0).sqrt() } else { 0.0 };
+            let segs = if sag > 1e-3 { 24 } else { 1 };
+            for k in 0..=segs {
+                let t = k as f32 / segs as f32;
+                pts.push(a + (b - a) * t - Vec2::Y * (4.0 * sag * t * (1.0 - t)));
+            }
+        }
+    }
+    polyline(geo, &pts, ROPE_W + 2.0 * OUTLINE, BG, false);
+    polyline(geo, &pts, ROPE_W, WHITE, false);
+}
+
+/// Flat spiral spring: inner end on the body at `angle`, unwinding as it
+/// is twisted.
+fn draw_torsion(geo: &mut GeometryBuilder, p: Vec2, angle: f32, twist: f32) {
+    let (r0, r1, turns) = (0.07, 0.2, 2.25);
+    let sweep = turns * std::f32::consts::TAU - twist;
+    let segs = 72;
+    let pts: Vec<Vec2> = (0..=segs).map(|k| {
+        let t = k as f32 / segs as f32;
+        let a = angle + sweep * t;
+        p + Vec2::new(a.cos(), a.sin()) * (r0 + (r1 - r0) * t)
+    }).collect();
+    polyline(geo, &pts, 0.02 + 2.0 * OUTLINE, BG, false);
+    polyline(geo, &pts, 0.02, WHITE, false);
+    // Outer end hooks onto a short post.
+    let end = *pts.last().unwrap();
+    geo.draw_circle(end, 0.03, 12, WHITE);
 }
 
 fn cylinders(world: &World) -> impl Iterator<Item = &Cylinder> {
@@ -500,6 +789,30 @@ mod tests {
         w.kinetic_energy() + w.potential_energy(g)
     }
 
+    /// Every scene draws (with the force overlay and a butterfly ghost)
+    /// without panicking or producing non-finite vertices, also mid-run.
+    #[test]
+    fn scenes_draw() {
+        for def in SCENES {
+            let mut w = (def.build)();
+            w.record_reactions = true;
+            let ghost = crate::scene_file::clone_world(&w);
+            for frame in 0..3 {
+                let mut geo = GeometryBuilder::new();
+                let (tints, load) = force_tints(&w, 1.0);
+                draw_world(&w, free_com_y(&w), &tints, &mut geo);
+                draw_force_arrows(&w, &mut geo, 0.01, load.max(1.0));
+                draw_ghost(&ghost, &mut geo, 0.01);
+                assert!(w.bodies.is_empty() || !geo.vertices.is_empty(), "{} drew nothing", def.name);
+                assert!(
+                    geo.vertices.iter().all(|v| v.position.iter().chain(&v.color).all(|x| x.is_finite())),
+                    "{}: non-finite vertex on frame {frame}", def.name,
+                );
+                for _ in 0..120 { w.step(1.0 / 240.0); }
+            }
+        }
+    }
+
     /// Every scene runs 20 s at the app's step size without blowing up,
     /// keeps its constraints, and stays inside (a margin around) its view.
     #[test]
@@ -533,6 +846,145 @@ mod tests {
             assert!(w.bodies.iter().all(|b| b.pos32().is_finite() && b.vel.is_finite()), "{} blew up", def.name);
             assert!(max_err < 0.02, "{}: constraint error {max_err}", def.name);
             assert!(max_out < 0.3, "{}: left its view by {max_out}", def.name);
+        }
+    }
+}
+
+// ── Force overlay ─────────────────────────────────────────────────────────────
+
+const TENSION:     [f32; 4] = [0.95, 0.30, 0.22, 1.0];
+const COMPRESSION: [f32; 4] = [0.30, 0.55, 1.0, 1.0];
+const ARROW:       [f32; 4] = [1.0, 0.78, 0.25, 1.0];
+/// Longest arrow drawn, in world units, for the largest force on show.
+const ARROW_MAX: f32 = 0.9;
+
+/// Where each constraint's force acts, and on which body: a joint's
+/// location and the body it pushes (the second of a pair, the hanging one
+/// in a chain; the supported body at a world pin).
+fn force_sites(world: &World) -> Vec<(usize, usize, Vec2)> {
+    let b = &world.bodies;
+    let n = b.len();
+    let mut out = Vec::new();
+    for (ci, c) in world.constraints.iter().enumerate() {
+        let any = c.as_any();
+        if let Some(p) = any.downcast_ref::<PinJoint>() {
+            if p.body_b < n { out.push((ci, p.body_b, b[p.body_b].world_point(p.local_b))); }
+        } else if let Some(p) = any.downcast_ref::<PinWorld>() {
+            out.push((ci, p.body, p.target));
+        } else if let Some(d) = any.downcast_ref::<DistanceConstraint>() {
+            if d.body_a < n && d.body_b < n {
+                out.push((ci, d.body_a, b[d.body_a].world_point(d.local_a)));
+                out.push((ci, d.body_b, b[d.body_b].world_point(d.local_b)));
+            }
+        } else if let Some(s) = any.downcast_ref::<SliderJoint>() {
+            if s.rider < n { out.push((ci, s.rider, b[s.rider].world_point(s.local))); }
+        } else if let Some(r) = any.downcast_ref::<Rope>() {
+            if r.body_a < n && r.body_b < n {
+                out.push((ci, r.body_a, b[r.body_a].world_point(r.local_a)));
+                out.push((ci, r.body_b, b[r.body_b].world_point(r.local_b)));
+            }
+        } else if let Some(r) = any.downcast_ref::<crate::sim::constraints::RollingContact>() {
+            if r.body_a < n && r.body_b < n {
+                let (pa, pb) = (b[r.body_a].pos32(), b[r.body_b].pos32());
+                let ra = disk_r(&b[r.body_a]).unwrap_or(0.0);
+                out.push((ci, r.body_b, pa + (pb - pa).normalize_or_zero() * ra));
+            }
+        } else if let Some(r) = any.downcast_ref::<crate::sim::constraints::RollingOnRod>() {
+            if r.disk < n && r.rod < n {
+                let rr = disk_r(&b[r.disk]).unwrap_or(0.0);
+                let (s, c) = b[r.rod].angle32().sin_cos();
+                let m = Vec2::new(-s, c);
+                let side = if m.dot(b[r.disk].pos32() - b[r.rod].pos32()) < 0.0 { 1.0 } else { -1.0 };
+                out.push((ci, r.disk, b[r.disk].pos32() + m * side * rr));
+            }
+        }
+    }
+    out
+}
+
+/// Axial load in every rod from the joints at its ends, tension positive,
+/// and a tint from white towards red (tension) or blue (compression),
+/// scaled by `scale` (the load drawn at full colour).
+pub fn force_tints(world: &World, scale: f32) -> (Vec<[f32; 4]>, f32) {
+    let b = &world.bodies;
+    let mut load = vec![0.0f32; b.len()];
+    if world.reactions.len() == world.constraints.len() {
+        for (ci, body, p) in force_sites(world) {
+            let BodyShape::Rod { half_len, .. } = b[body].shape else { continue };
+            let (s, c) = b[body].angle32().sin_cos();
+            let u = Vec2::new(c, s);
+            let along = u.dot(p - b[body].pos32());
+            if along.abs() < 0.25 * half_len { continue; }
+            let f = world.reactions[ci].on(body).as_vec2();
+            // Pulling an end outward stretches the rod.
+            load[body] += along.signum() * f.dot(u) * 0.5;
+        }
+    }
+    let max = load.iter().fold(0.0f32, |m, l| m.max(l.abs()));
+    let tints = load.iter().map(|&l| {
+        let k = (l.abs() / scale.max(1e-6)).min(1.0).sqrt();
+        lerp_color(WHITE, if l > 0.0 { TENSION } else { COMPRESSION }, k)
+    }).collect();
+    (tints, max)
+}
+
+fn draw_arrow(geo: &mut GeometryBuilder, from: Vec2, v: Vec2, w: f32, color: [f32; 4]) {
+    let len = v.length();
+    if len < 1e-4 { return; }
+    let dir = v / len;
+    let head = (w * 4.0).min(len * 0.5);
+    let tip = from + v;
+    geo.draw_line(from, tip - dir * head * 0.8, w, color);
+    let side = dir.perp() * head * 0.55;
+    geo.draw_quad(tip, tip - dir * head + side, tip - dir * head * 0.75, tip - dir * head - side, color);
+}
+
+/// Arrows for the force each joint (and each contact) applies, scaled so
+/// a force of `scale` draws `ARROW_MAX` long. Returns the largest force.
+pub fn draw_force_arrows(world: &World, geo: &mut GeometryBuilder, px: f32, scale: f32) -> f32 {
+    let k = ARROW_MAX / scale.max(1e-6);
+    let w = 2.5 * px;
+    let mut max = 0.0f32;
+    if world.reactions.len() == world.constraints.len() {
+        for (ci, body, p) in force_sites(world) {
+            let f = world.reactions[ci].on(body).as_vec2();
+            max = max.max(f.length());
+            geo.draw_circle(p, 3.0 * px, 10, ARROW);
+            draw_arrow(geo, p, f * k, w, ARROW);
+        }
+    }
+    for c in &world.contacts.last {
+        let f = (c.n * c.f_n + c.n.perp() * c.f_t).as_vec2();
+        max = max.max(f.length());
+        draw_arrow(geo, c.p.as_vec2(), f * k, w, ARROW);
+    }
+    max
+}
+
+/// The butterfly ghost: each body as a translucent outline.
+pub fn draw_ghost(world: &World, geo: &mut GeometryBuilder, px: f32) {
+    const GHOST: [f32; 4] = [0.95, 0.35, 0.25, 0.75];
+    let w = 2.0 * px;
+    for b in world.bodies.iter().filter(|b| !b.fixed) {
+        match b.shape {
+            BodyShape::Disk { radius } => {
+                geo.draw_arc(b.pos32(), radius, 0.0, std::f32::consts::TAU, 48, w, GHOST);
+                let (s, c) = b.angle32().sin_cos();
+                geo.draw_line(b.pos32(), b.pos32() + Vec2::new(c, s) * radius, w, GHOST);
+            }
+            BodyShape::Rod { half_len, half_width } => {
+                let (s, c) = b.angle32().sin_cos();
+                let (u, m) = (Vec2::new(c, s), Vec2::new(-s, c));
+                let p = b.pos32();
+                for side in [-1.0, 1.0] {
+                    geo.draw_line(p - u * half_len + m * side * half_width, p + u * half_len + m * side * half_width, w, GHOST);
+                }
+                let a = s.atan2(c);
+                let half = std::f32::consts::FRAC_PI_2;
+                geo.draw_arc(p + u * half_len, half_width, a - half, a + half, 8, w, GHOST);
+                geo.draw_arc(p - u * half_len, half_width, a + half, a + 3.0 * half, 8, w, GHOST);
+            }
+            BodyShape::Point => {}
         }
     }
 }
