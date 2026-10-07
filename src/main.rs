@@ -63,8 +63,12 @@ impl ApplicationHandler<UserEvent> for PhysicsApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Ready(app) => {
-                self.app = Some(*app);
+                let app = self.app.insert(*app);
                 if let Some(window) = self.window {
+                    // The canvas got its real size (a `Resized` event) while
+                    // `App::new` was still awaiting the GPU, when there was no
+                    // app to receive it; catch up now.
+                    app.resize(window.inner_size());
                     window.request_redraw();
                 }
             }

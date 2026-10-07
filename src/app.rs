@@ -377,6 +377,16 @@ impl App {
         self.editor.inspect_shape = Some(shape_tag);
     }
 
+    /// Resize the surface and, until the user pans or zooms, refit the camera.
+    pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        self.render_state.resize(size);
+        self.window_size = size;
+        if self.camera_fitted && size.width > 0 && size.height > 0 {
+            let view = self.custom_view.unwrap_or(SCENES[self.current_scene_idx].view_size);
+            self.camera.scale = fit_scale(view, self.screen_size());
+        }
+    }
+
     fn screen_size(&self) -> Vec2 {
         Vec2::new(self.window_size.width as f32, self.window_size.height as f32)
     }
@@ -567,14 +577,7 @@ impl App {
         }
 
         match event {
-            WindowEvent::Resized(size) => {
-                self.render_state.resize(*size);
-                self.window_size = *size;
-                if self.camera_fitted && size.width > 0 && size.height > 0 {
-                    let view = self.custom_view.unwrap_or(SCENES[self.current_scene_idx].view_size);
-                    self.camera.scale = fit_scale(view, self.screen_size());
-                }
-            }
+            WindowEvent::Resized(size) => self.resize(*size),
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key, state, .. }, .. } => {
                 if *state == ElementState::Pressed {
                     match physical_key {
