@@ -556,7 +556,7 @@ fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut Wor
     }
 
     // Selected body
-    if matches!(editor.mode, EditorMode::Inspecting { .. }) {
+    if let EditorMode::Inspecting { body_idx } = editor.mode {
         let shape = editor.inspect_shape.clone().unwrap_or_else(|| "Body".into());
         if let Some(edit) = &mut editor.body_edit {
             ui.add_space(10.0);
@@ -577,6 +577,20 @@ fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut Wor
                 toggle_row(ui, "FIXED", &mut edit.fixed);
                 if shape != "Point" { toggle_row(ui, "COLLIDE", &mut edit.collide); }
             });
+            // One-click world pins on the natural spots.
+            if let Some(body) = world.bodies.get(body_idx) {
+                let spots = crate::editor::quick_pin_points(body);
+                if !spots.is_empty() {
+                    ui.horizontal(|ui| {
+                        for (lbl, local) in spots {
+                            let mut on = crate::editor::world_pin_at(world, body_idx, local).is_some();
+                            let was = on;
+                            toggle_row(ui, lbl, &mut on);
+                            if on != was { crate::editor::toggle_world_pin(world, body_idx, local); }
+                        }
+                    });
+                }
+            }
             ui.add_space(4.0);
             if danger_btn(ui, "DELETE", ui.available_width()).clicked() {
                 editor.delete_requested = true;

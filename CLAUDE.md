@@ -38,7 +38,7 @@ Analysis and sharing (`App::analysis`, an `analysis::Analysis`; main panel SHOW 
 - **Share**: `SceneFile` (serde records for every body/constraint/force type, plus contact material and view) → JSON → deflate → base64url `psim1:` code. Native copies to the clipboard; the web build puts it in the URL hash `#s=` (and the clipboard), loads it at start and on hash change. A loaded scene shows as "Shared Scene"; RESET reloads it.
 - **Undo/redo** (editor UNDO/REDO, Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y): `UndoStack` of JSON snapshots, committed each frame the editor is paused and no button is held, when the world changed. Restores go through `App::replace_world`.
 
-Editor connections: Shift-click two bodies, then PIN JOINT, DISTANCE ROD, ROLLING, GEAR / BELT (two disks), SLIDER, CYLINDER, ROPE, ROPE OVER PULLEY (then click the pulley disk: `EditorMode::PulleyPending`), SPRING or TORSION SPRING. Contact material sliders sit under New body.
+Editor connections: Shift-click two bodies, then PIN JOINT, DISTANCE ROD, ROLLING, GEAR / BELT (two disks), SLIDER, CYLINDER, ROPE, ROPE OVER PULLEY (then click the pulley disk: `EditorMode::PulleyPending`), SPRING or TORSION SPRING. Contact material sliders sit under New body. The body inspector's PIN CENTRE (disk) and PIN LEFT/RIGHT (or BOTTOM/TOP) (rod ends) toggles add or remove a `PinWorld` at that spot (`editor::toggle_world_pin`), so no anchor needs placing. Every world pin on a body follows it through editor drags, turns and resizes (`editor::sync_world_pins`, called only from editor actions, never while simulating).
 
 Mouse interaction: left-click picks a body (hit-tests disks and rods), attaches a `MouseSpring` force via `Arc<Mutex<MouseSpringData>>` shared between `App` and the force.
 

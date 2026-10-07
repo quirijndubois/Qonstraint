@@ -117,6 +117,7 @@ pub fn resize_to(world: &mut World, idx: usize, kind: ResizeKind, cursor: Vec2, 
             let b = &mut world.bodies[idx];
             let (sn, cs) = b.angle.sin_cos();
             b.pos += glam::DVec2::new(cs, sn) * (e * (new_hl - half_len)) as f64;
+            sync_world_pins(world, idx);
             return;
         }
         (ResizeKind::Width, BodyShape::Rod { half_len, .. }) => {
@@ -125,6 +126,7 @@ pub fn resize_to(world: &mut World, idx: usize, kind: ResizeKind, cursor: Vec2, 
         _ => return,
     };
     set_shape(world, idx, shape);
+    sync_world_pins(world, idx);
 }
 
 /// Change a body's size, keeping its centre and recomputing inertia. Every
@@ -227,7 +229,8 @@ impl BodyEdit {
     /// size change goes through `set_shape` so attachments follow.
     pub fn apply_to(&mut self, world: &mut World, idx: usize) {
         let body = &mut world.bodies[idx];
-        if self.angle != self.angle_synced {
+        let turned = self.angle != self.angle_synced;
+        if turned {
             set_angle_degrees(body, self.angle);
         } else {
             // Follow the body while it turns (simulation running in edit mode).
@@ -248,7 +251,25 @@ impl BodyEdit {
             BodyShape::Rod { .. } => BodyShape::Rod { half_len: self.half_len, half_width: self.half_width },
             BodyShape::Point => BodyShape::Point,
         };
+        let resized = match (&body.shape, &shape) {
+            (BodyShape::Disk { radius: a }, BodyShape::Disk { radius: b }) => a != b,
+            (BodyShape::Rod { half_len: l0, half_width: w0 }, BodyShape::Rod { half_len: l1, half_width: w1 }) => l0 != l1 || w0 != w1,
+            _ => false,
+        };
         set_shape(world, idx, shape);
+        if turned || resized { sync_world_pins(world, idx); }
+    }
+}
+
+/// After the editor moves, turns or resizes body `idx`, bring its world
+/// pins along: each pin's world point becomes wherever its body point now
+/// is. (Only for editor moves: the simulation must never drag pins.)
+pub fn sync_world_pins(world: &mut World, idx: usize) {
+    let Some(body) = world.bodies.get(idx) else { return };
+    for c in world.constraints.iter_mut() {
+        if let Some(pw) = c.as_any_mut().downcast_mut::<PinWorld>() {
+            if pw.body == idx { pw.target = body.world_point(pw.local); }
+        }
     }
 }
 
@@ -605,6 +626,44 @@ pub fn add_rope_over(a: usize, attach_a: Vec2, b: usize, attach_b: Vec2, pulley:
     }
 }
 
+/// Points that can be pinned to the world with one click from the
+/// inspector: a disk's centre, a rod's two ends. Rod ends are named by
+/// where they are right now (left/right, or top/bottom when upright).
+pub fn quick_pin_points(body: &Body) -> Vec<(&'static str, Vec2)> {
+    match body.shape {
+        BodyShape::Disk { .. } => vec![("PIN CENTRE", Vec2::ZERO)],
+        BodyShape::Rod { half_len, .. } => {
+            let (a, b) = (Vec2::new(-half_len, 0.0), Vec2::new(half_len, 0.0));
+            let d = body.world_point(b) - body.world_point(a);
+            let upright = d.y.abs() > d.x.abs();
+            let (lo, hi) = if upright { ("PIN BOTTOM", "PIN TOP") } else { ("PIN LEFT", "PIN RIGHT") };
+            // `a` comes first along the axis that names them.
+            let a_first = if upright { d.y > 0.0 } else { d.x > 0.0 };
+            if a_first { vec![(lo, a), (hi, b)] } else { vec![(lo, b), (hi, a)] }
+        }
+        BodyShape::Point => vec![],
+    }
+}
+
+/// The world pin holding body-local point `local` of `body`, if any.
+pub fn world_pin_at(world: &World, body: usize, local: Vec2) -> Option<usize> {
+    world.constraints.iter().position(|c| {
+        c.as_any().downcast_ref::<PinWorld>()
+            .is_some_and(|pw| pw.body == body && (pw.local - local).length() < 1e-3)
+    })
+}
+
+/// Pin `local` of `body` to the world where it is now, or remove that pin.
+pub fn toggle_world_pin(world: &mut World, body: usize, local: Vec2) {
+    match world_pin_at(world, body, local) {
+        Some(ci) => { world.constraints.remove(ci); }
+        None => {
+            let at = world.bodies[body].world_point(local);
+            world.add_constraint(PinWorld::new(body, local, at));
+        }
+    }
+}
+
 /// Gears and belts join two disks.
 pub fn can_gear(a: &Body, b: &Body) -> bool {
     is_disk(a) && is_disk(b)
@@ -918,6 +977,52 @@ mod tests {
         assert!((w.tracers[0].local - Vec2::new(0.75, 0.0)).length() < 1e-4);
         let still = w.bodies[a].world_point(pj.local_a);
         assert!((still - plus_end).length() < 1e-4, "fixed end moved: {still} vs {plus_end}");
+    }
+
+    /// Quick pins toggle on and off at a rod's ends, named by position.
+    #[test]
+    fn quick_pins_toggle() {
+        let mut w = World::new();
+        let r = w.add_body(Body::new(Vec2::ZERO, std::f32::consts::PI, 1.0, 1.0, BodyShape::Rod { half_len: 1.0, half_width: 0.06 }));
+        let spots = quick_pin_points(&w.bodies[r]);
+        // Turned half round: the local +x end is now on the left.
+        assert_eq!(spots[0].0, "PIN LEFT");
+        assert!((spots[0].1 - Vec2::new(1.0, 0.0)).length() < 1e-6);
+        toggle_world_pin(&mut w, r, spots[0].1);
+        let pw = w.constraints[0].as_any().downcast_ref::<PinWorld>().unwrap();
+        assert!((pw.target - Vec2::new(-1.0, 0.0)).length() < 1e-5);
+        assert!(world_pin_at(&w, r, spots[0].1).is_some());
+        toggle_world_pin(&mut w, r, spots[0].1);
+        assert!(w.constraints.is_empty());
+    }
+
+    /// World pins follow their body through editor moves, turns and resizes.
+    #[test]
+    fn world_pins_follow_editor_moves() {
+        let mut w = World::new();
+        let r = w.add_body(rod(Vec2::ZERO, 1.0));
+        let end = quick_pin_points(&w.bodies[r])[1].1;
+        toggle_world_pin(&mut w, r, end);
+        let pin = |w: &World| w.constraints[0].as_any().downcast_ref::<PinWorld>().unwrap().clone();
+        let on_end = |w: &World| {
+            let p = pin(w);
+            let BodyShape::Rod { half_len, .. } = w.bodies[r].shape else { return false };
+            (p.local - Vec2::new(half_len, 0.0)).length() < 1e-5
+                && (p.target - w.bodies[r].world_point(p.local)).length() < 1e-5
+        };
+        assert!((end - Vec2::new(1.0, 0.0)).length() < 1e-6);
+
+        w.bodies[r].pos += glam::DVec2::new(2.0, 1.0);
+        sync_world_pins(&mut w, r);
+        assert!(on_end(&w), "drag");
+        set_angle_degrees(&mut w.bodies[r], 70.0);
+        sync_world_pins(&mut w, r);
+        assert!(on_end(&w), "rotate");
+        let mut edit = BodyEdit::from_body(&w.bodies[r]);
+        edit.half_len = 1.6;
+        edit.apply_to(&mut w, r);
+        assert!(on_end(&w), "resize by slider");
+        assert!(w.constraint_error() < 1e-5);
     }
 
     /// A pin on a disk's rim stays on the rim when the radius changes.

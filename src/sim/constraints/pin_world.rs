@@ -4,6 +4,7 @@ use crate::sim::body::Body;
 use crate::sim::constraint::{Attach, Constraint, ConstraintEval};
 
 /// Pins a point on a body to a fixed world position (2 scalar equations).
+#[derive(Clone)]
 pub struct PinWorld {
     pub body: usize,
     pub local: Vec2,

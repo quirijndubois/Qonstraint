@@ -283,6 +283,7 @@ impl App {
         if let EditorMode::Dragging { .. } = self.editor.mode {
             let wp = self.editor_point(Some(idx));
             self.world.bodies[idx].pos = wp.as_dvec2();
+            crate::editor::sync_world_pins(&mut self.world, idx);
         }
         let b = &mut self.world.bodies[idx];
         b.vel = glam::DVec2::ZERO;
@@ -597,6 +598,7 @@ impl App {
                                     let step = if self.shift_held { -15.0f64 } else { 15.0 };
                                     if let Some(b) = self.world.bodies.get_mut(body_idx) {
                                         b.angle += step.to_radians();
+                                        crate::editor::sync_world_pins(&mut self.world, body_idx);
                                     }
                                     self.inspect_body(body_idx);
                                 }
@@ -648,6 +650,7 @@ impl App {
                             // Snap the body's centre, never onto its own features.
                             let wp = self.editor_point(Some(body_idx));
                             self.world.bodies[body_idx].pos = wp.as_dvec2();
+                            crate::editor::sync_world_pins(&mut self.world, body_idx);
                         }
                         EditorMode::DraggingHandle { handle, .. } => {
                             let wp = self.editor_point(None);
@@ -663,6 +666,7 @@ impl App {
                             let mut deg = (d.y.atan2(d.x) + offset).to_degrees();
                             if self.ctrl_held { deg = (deg / 15.0).round() * 15.0; }
                             crate::editor::set_angle_degrees(&mut self.world.bodies[body_idx], deg);
+                            crate::editor::sync_world_pins(&mut self.world, body_idx);
                         }
                         _ => {}
                     }
