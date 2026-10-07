@@ -6,6 +6,8 @@
 
 An interactive 2D rigid-body physics sandbox written in Rust. Bodies are held together by exact constraint forces (Witkin's method) instead of penalty springs, so linkages, rolling wheels, sliders and gas cylinders stay together while energy stays close to constant. It runs natively and in the browser (WebGPU, with a WebGL2 fallback).
 
+Inspired by [this video](https://www.youtube.com/watch?v=TtgS-b191V0) by AngeTheGreat.
+
 ## Scenes
 
 | Scene | What happens |

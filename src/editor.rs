@@ -424,7 +424,7 @@ impl Default for Editor {
             gravity:            9.81,
             sub_steps:          4,
             step_mode:          StepMode::TargetFps,
-            integrator:         Integrator::Xpbd,
+            integrator:         Integrator::Rk4,
             paused:             false,
             target_fps:         60.0,
             time_scale:         1.0,

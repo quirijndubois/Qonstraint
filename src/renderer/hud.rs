@@ -62,7 +62,6 @@ pub struct Metrics {
     pub kinetic_energy:   f32,
     pub potential_energy: f32,
     pub constraint_error: f32,
-    pub running:          bool,
 }
 
 #[derive(Default)]
@@ -179,7 +178,7 @@ impl Hud {
             out = draw_main_panel(ctx, metrics, history, scene_idx, scene_count, scene_name, scene_desc, editor, analysis);
             if editor.active {
                 draw_editor_panel(ctx, editor, world, undo, &mut out);
-            } else {
+            } else if analysis.show_timeline {
                 draw_timeline(ctx, analysis, &mut out);
             }
             if analysis.show_share { draw_share_panel(ctx, analysis, &mut out); }
@@ -314,6 +313,10 @@ fn draw_main_panel(
                     if hud_btn(ui, "EDIT", editor.active, 0.0).clicked() { out.toggle_edit = true; }
                     let lbl = if editor.paused { "PLAY" } else { "PAUSE" };
                     if hud_btn(ui, lbl, editor.paused, 0.0).clicked() { editor.paused = !editor.paused; }
+                    if hud_btn(ui, "SHARE", analysis.show_share, 0.0).clicked() {
+                        analysis.show_share = !analysis.show_share;
+                        if analysis.show_share { out.share = true; }
+                    }
                 });
 
                 ui.add_space(10.0);
@@ -364,34 +367,14 @@ fn draw_main_panel(
                     if hud_btn(ui, "FORCES", analysis.show_forces, 0.0).clicked() { analysis.show_forces = !analysis.show_forces; }
                     if hud_btn(ui, "PHASE", analysis.show_phase, 0.0).clicked() { analysis.show_phase = !analysis.show_phase; }
                     if hud_btn(ui, "CHAOS", analysis.show_chaos, 0.0).clicked() { out.toggle_chaos = true; }
-                    if hud_btn(ui, "SHARE", analysis.show_share, 0.0).clicked() {
-                        analysis.show_share = !analysis.show_share;
-                        if analysis.show_share { out.share = true; }
+                    if hud_btn(ui, "REWIND", analysis.show_timeline, 0.0).clicked() {
+                        analysis.show_timeline = !analysis.show_timeline;
                     }
                 });
                 if analysis.show_forces {
                     ui.label(text("Arrows: joint and contact forces", SMALL_SIZE, MUTED));
                     ui.label(text("Rods: red in tension, blue in compression", SMALL_SIZE, MUTED));
                 }
-                ui.add_space(10.0);
-
-                // Status line
-                let state = match (m.running, (editor.time_scale - 1.0).abs() > 0.005) {
-                    (false, _)    => "Paused".to_owned(),
-                    (true, false) => "Running".to_owned(),
-                    (true, true)  => format!("Running {:.2}x", editor.time_scale),
-                };
-                let (health, col) = if editor.active {
-                    ("Editing", WHITE)
-                } else if m.constraint_error > 1e-2 {
-                    ("Drift", RED)
-                } else {
-                    ("Okay", WHITE)
-                };
-                ui.horizontal(|ui| {
-                    ui.label(text(format!("{state} //"), HEAD_SIZE + 1.0, WHITE));
-                    ui.label(text(health, HEAD_SIZE + 1.0, col));
-                });
             });
         });
 
@@ -650,7 +633,6 @@ fn editor_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut Wor
 /// Scrub bar along the bottom: drag to rewind, PLAY resumes from there.
 fn draw_timeline(ctx: &egui::Context, a: &mut Analysis, out: &mut HudOutput) {
     let n = a.timeline.len();
-    if n < 2 { return; }
     let screen = ctx.screen_rect();
     let width = (screen.width() - 32.0).clamp(200.0, 720.0);
     egui::Area::new(egui::Id::new("timeline"))
@@ -660,14 +642,21 @@ fn draw_timeline(ctx: &egui::Context, a: &mut Analysis, out: &mut HudOutput) {
                 ui.set_width(width);
                 ui.horizontal(|ui| {
                     ui.label(text("Rewind", BODY_SIZE, WHITE));
-                    let mut i = a.timeline.cursor.unwrap_or(n - 1);
-                    let before = i;
-                    ui.spacing_mut().slider_width = width - 190.0;
-                    ui.add(egui::Slider::new(&mut i, 0..=n - 1).show_value(false));
-                    let age = a.timeline.age(i);
-                    let lbl = if a.timeline.cursor.is_some() { format!("-{age:.1} S") } else { "LIVE".to_owned() };
-                    ui.label(text(lbl, BODY_SIZE, if a.timeline.cursor.is_some() { RED } else { WHITE }));
-                    if i != before { out.scrub = Some(i); }
+                    if n < 2 {
+                        ui.label(text("No history yet // records while running", BODY_SIZE, MUTED));
+                    } else {
+                        let mut i = a.timeline.cursor.unwrap_or(n - 1);
+                        let before = i;
+                        ui.spacing_mut().slider_width = width - 220.0;
+                        ui.add(egui::Slider::new(&mut i, 0..=n - 1).show_value(false));
+                        let age = a.timeline.age(i);
+                        let lbl = if a.timeline.cursor.is_some() { format!("-{age:.1} S") } else { "LIVE".to_owned() };
+                        ui.label(text(lbl, BODY_SIZE, if a.timeline.cursor.is_some() { RED } else { WHITE }));
+                        if i != before { out.scrub = Some(i); }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if hud_btn(ui, "X", false, 22.0).clicked() { a.show_timeline = false; }
+                    });
                 });
             });
         });
@@ -1170,7 +1159,7 @@ mod tests {
         for def in SCENES {
             let mut world = (def.build)();
             let mut editor = Editor { active: true, ..Default::default() };
-            let mut a = Analysis { show_phase: true, show_chaos: true, show_share: true, show_forces: true, ..Default::default() };
+            let mut a = Analysis { show_phase: true, show_chaos: true, show_share: true, show_forces: true, show_timeline: true, ..Default::default() };
             a.share_code = "psim1:abc".into();
             for _ in 0..30 {
                 world.step(1.0 / 240.0);
@@ -1181,7 +1170,7 @@ mod tests {
             let mut bf = Butterfly::seed(&world, &mouse);
             bf.sample(&world, 0.01);
             a.butterfly = Some(bf);
-            let metrics = Metrics { fps: 60.0, sub_steps: 10, kinetic_energy: 1.0, potential_energy: 2.0, constraint_error: 1e-6, running: true };
+            let metrics = Metrics { fps: 60.0, sub_steps: 10, kinetic_energy: 1.0, potential_energy: 2.0, constraint_error: 1e-6 };
             let history = History::default();
             let mut modes = vec![EditorMode::Idle, EditorMode::PlacingBody];
             if world.bodies.len() >= 2 {

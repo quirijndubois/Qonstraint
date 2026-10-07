@@ -307,6 +307,8 @@ pub struct Analysis {
     pub show_forces: bool,
     pub show_phase: bool,
     pub show_chaos: bool,
+    /// Rewind bar open (history is recorded either way).
+    pub show_timeline: bool,
     /// Share panel open, the code shown in it, and what the user pasted.
     pub show_share: bool,
     pub share_code: String,

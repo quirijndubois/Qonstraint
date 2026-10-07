@@ -892,7 +892,6 @@ impl App {
             kinetic_energy:   ke,
             potential_energy: pe,
             constraint_error: err,
-            running:          !self.editor.paused,
         };
 
         let scene_count = SCENES.len();
