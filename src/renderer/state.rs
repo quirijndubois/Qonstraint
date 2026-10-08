@@ -276,8 +276,46 @@ impl RenderState {
         camera: &Camera,
         geo: &GeometryBuilder,
     ) -> Result<(wgpu::SurfaceTexture, wgpu::TextureView, wgpu::CommandEncoder), wgpu::SurfaceError> {
-        let w = self.size.width  as f32;
-        let h = self.size.height as f32;
+        self.upload(camera, geo, self.size.width as f32, self.size.height as f32);
+
+        let output = self.surface.get_current_texture()?;
+        let surface_view = output.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.view_format),
+            ..Default::default()
+        });
+        let mut encoder  = self.device.create_command_encoder(&Default::default());
+        self.encode_scene(&mut encoder, &self.msaa_view, &surface_view, geo.indices.len() as u32);
+
+        Ok((output, surface_view, encoder))
+    }
+
+    /// Draw `geo` seen through `camera` into a new `width` × `height`
+    /// texture (for a thumbnail), submitted at once. Call it outside a
+    /// frame: uniforms and buffers are shared with `render_geometry`.
+    pub fn render_to_texture(&mut self, camera: &Camera, geo: &GeometryBuilder, width: u32, height: u32) -> wgpu::TextureView {
+        self.upload(camera, geo, width as f32, height as f32);
+        let config = wgpu::SurfaceConfiguration { width, height, ..self.config.clone() };
+        let msaa = create_msaa_view(&self.device, &config, self.view_format);
+        let target = self.device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("thumbnail"),
+                size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count:    1,
+                dimension:       wgpu::TextureDimension::D2,
+                format:          self.view_format,
+                usage:           wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats:    &[],
+            })
+            .create_view(&Default::default());
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.encode_scene(&mut encoder, &msaa, &target, geo.indices.len() as u32);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        target
+    }
+
+    /// Uniforms for a `w` × `h` target, and the geometry buffers.
+    fn upload(&mut self, camera: &Camera, geo: &GeometryBuilder, w: f32, h: f32) {
         let vp     = camera.view_proj(w, h);
         let inv_vp = vp.inverse();
         let uniforms = Uniforms {
@@ -312,43 +350,35 @@ impl RenderState {
             self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&geo.vertices));
             self.queue.write_buffer(&self.index_buffer,  0, bytemuck::cast_slice(&geo.indices));
         }
+    }
 
-        let output = self.surface.get_current_texture()?;
-        let surface_view = output.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(self.view_format),
-            ..Default::default()
+    /// Grid, then the uploaded geometry, into `msaa` resolved to `target`.
+    fn encode_scene(&self, encoder: &mut wgpu::CommandEncoder, msaa: &wgpu::TextureView, target: &wgpu::TextureView, n_indices: u32) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view:           msaa,           // MSAA render target
+                resolve_target: Some(target),   // resolved to swapchain / texture
+                ops: wgpu::Operations {
+                    load:  wgpu::LoadOp::Clear(wgpu::Color { r: 0.018, g: 0.019, b: 0.023, a: 1.0 }),
+                    store: wgpu::StoreOp::Discard,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes:         None,
+            occlusion_query_set:      None,
         });
-        let mut encoder  = self.device.create_command_encoder(&Default::default());
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view:           &self.msaa_view,        // MSAA render target
-                    resolve_target: Some(&surface_view),    // resolved to swapchain
-                    ops: wgpu::Operations {
-                        load:  wgpu::LoadOp::Clear(wgpu::Color { r: 0.018, g: 0.019, b: 0.023, a: 1.0 }),
-                        store: wgpu::StoreOp::Discard,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes:         None,
-                occlusion_query_set:      None,
-            });
+        pass.set_pipeline(&self.grid_pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..3, 0..1);
 
-            pass.set_pipeline(&self.grid_pipeline);
+        if n_indices > 0 {
+            pass.set_pipeline(&self.geo_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-
-            if !geo.indices.is_empty() {
-                pass.set_pipeline(&self.geo_pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..geo.indices.len() as u32, 0, 0..1);
-            }
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..n_indices, 0, 0..1);
         }
-
-        Ok((output, surface_view, encoder))
     }
 }

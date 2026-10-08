@@ -1,19 +1,22 @@
 use glam::Vec2;
 
 use crate::sim::{
-    constraints::{PinJoint, PinWorld, RollingOnRod},
+    constraints::{PinJoint, PinWorld},
     forces::{Gravity, SpringDamper},
     world::World,
 };
 use super::{anchor, disk, rod_between};
 
 // A lever pivoted at its right end on a floor mount and held up at its left
-// end by a spring. A heavy disk rolls on top of the lever; a coupler links
-// the disk's centre to one end of a rocker that pivots at its middle from a
-// ceiling mount, with a small disk on the rocker's far end.
+// end by a spring. A heavy disk rests on top of the lever, held there by
+// contact alone (both COLLIDE, grippy and nearly dead), so it rolls but can
+// also hop or slip; a coupler links the disk's centre to one end of a
+// rocker that pivots at its middle from a ceiling mount, with a small disk
+// on the rocker's far end.
 //
-// 15 body coordinates − 12 constraint equations = 3 DOF: lever angle,
-// rocker angle, and the small disk's free spin.
+// 15 body coordinates − 10 constraint equations = 5 DOF: lever angle,
+// rocker angle, the disk's spin and lift-off, and the small disk's free
+// spin; the contact takes away two of them while it holds.
 
 const G: f32 = 9.81;
 
@@ -26,6 +29,10 @@ const LEVER_MASS:  f32  = 1.5;
 const DISK_R:      f32  = 0.75;
 const DISK_MASS:   f32  = 3.0;
 const DISK_ALONG:  f32  = 1.6; // disk centre's distance from lever's left end
+
+// Disk–lever contact material: grippy, so it rolls, and nearly dead.
+const FRICTION:    f32  = 1.2;
+const BOUNCE:      f32  = 0.05;
 
 const ROCKER_PIVOT: Vec2 = Vec2::new(2.0, 2.0);
 const ROCKER_ANGLE: f32  = -0.44;
@@ -62,8 +69,14 @@ pub fn build() -> World {
 
     let floor = w.add_body(anchor(Vec2::new(left.x, SPRING_FLOOR_Y)));
 
+    for b in [big, lever] {
+        let body = &mut w.bodies[b];
+        body.collide = true;
+        body.friction = FRICTION;
+        body.restitution = BOUNCE;
+    }
+
     w.add_constraint(PinWorld::new(lever, Vec2::new(lever_hl, 0.0), LEVER_PIVOT));
-    w.add_constraint(RollingOnRod::new(big, lever, &w.bodies).expect("disk on rod"));
     w.add_constraint(PinJoint::new(big, Vec2::ZERO, coupler, Vec2::new(-coupler_hl, 0.0)));
     w.add_constraint(PinJoint::new(coupler, Vec2::new(coupler_hl, 0.0), rocker, Vec2::new(-ROCKER_HL, 0.0)));
     w.add_constraint(PinWorld::new(rocker, Vec2::ZERO, ROCKER_PIVOT));

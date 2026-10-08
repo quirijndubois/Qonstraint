@@ -10,7 +10,8 @@ use super::{disk, rod_between};
 
 // Collisions with friction: a closed box with a motor-driven paddle that
 // keeps flinging a handful of disks and bars around. Every part has
-// COLLIDE on; the contact material (friction, bounce) is set in the editor.
+// COLLIDE on and the same contact material (friction, bounce), which the
+// editor sets per body.
 
 const HALF_W: f32 = 2.4;
 const HALF_H: f32 = 1.7;
@@ -19,8 +20,6 @@ const WALL: f32 = 0.08;
 pub fn build() -> World {
     let mut w = World::new();
     w.add_force(Gravity::new(9.81));
-    w.contacts.friction = 0.45;
-    w.contacts.restitution = 0.5;
 
     let corners = [
         Vec2::new(-HALF_W, -HALF_H), Vec2::new(HALF_W, -HALF_H),
@@ -55,5 +54,9 @@ pub fn build() -> World {
     let t = w.tracers.len();
     w.add_tracer(7, Vec2::ZERO);
     w.tracers[t].seconds = 2.0;
+    for b in &mut w.bodies {
+        b.friction = 0.45;
+        b.restitution = 0.5;
+    }
     w
 }

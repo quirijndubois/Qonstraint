@@ -1,6 +1,6 @@
 **[▶ Run it in your browser](https://quirijndubois.github.io/Qonstraint/)**
 
-> A Chromium-based browser (Chrome, Edge, Brave…) is highly recommended, and it is meant to be run on a computer: it needs a mouse (middle drag, scroll wheel) and a large screen, so phones and tablets are not supported.
+> It is meant to be run on a computer: it needs a mouse (middle drag, scroll wheel) and a large screen, so phones and tablets are not supported.
 
 # Qonstraint
 
@@ -21,9 +21,8 @@ Inspired by [this video](https://www.youtube.com/watch?v=TtgS-b191V0) by AngeThe
 | Planetary Pendulum | A disk rolls around a fixed disk with a pendulum on its rim |
 | Trammel | A bar slides on two crossed rails, and its tip traces an ellipse |
 | Air Struts | A hub bounces on two sealed air springs with a pendulum below |
-| Sandbox | Empty, opens in edit mode so you can build your own |
 
-Every scene is built from the same parts you can place in the editor.
+Every scene is built from the same parts you can place in the editor. LOAD opens a gallery of all scenes with thumbnails, NEW starts an empty scene in edit mode, and SAVE keeps the current scene under a name (in a data folder natively, in browser storage on the web); saved scenes show up in the LOAD gallery.
 
 ## Controls
 

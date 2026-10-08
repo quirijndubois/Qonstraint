@@ -16,6 +16,7 @@
 
 use glam::{DVec2, DVec3};
 use crate::sim::body::Body;
+use crate::sim::slot::Slot;
 use crate::sim::constraint::{Constraint, ConstraintEval, Reaction, MAX_BLOCKS, MAX_DIM};
 use crate::sim::contact::Contacts;
 use crate::sim::force::Force;
@@ -31,8 +32,8 @@ pub struct XpbdScratch {
 
 pub fn step(
     bodies: &mut [Body],
-    constraints: &[Box<dyn Constraint>],
-    forces: &[Box<dyn Force>],
+    constraints: &[Slot<dyn Constraint>],
+    forces: &[Slot<dyn Force>],
     contacts: &mut Contacts,
     dt: f64,
     s: &mut XpbdScratch,
@@ -40,8 +41,8 @@ pub fn step(
 ) {
     // Applied forces at the start-of-step state.
     for b in bodies.iter_mut() { b.clear_accumulators(); }
-    for f in forces { f.apply(bodies); }
-    for c in constraints { c.apply_forces(bodies, dt); }
+    for f in forces.iter().filter(|f| f.on) { f.apply(bodies); }
+    for c in constraints.iter().filter(|c| c.on) { c.apply_forces(bodies, dt); }
     contacts.apply(bodies, dt);
 
     s.prev.clear();
@@ -67,7 +68,7 @@ pub fn step(
 /// Pulls positions onto the constraints without touching velocities. Run
 /// once before the first step of a new or edited configuration: a step
 /// would otherwise turn any existing violation C into a velocity kick C/dt.
-pub fn settle(bodies: &mut [Body], constraints: &[Box<dyn Constraint>], s: &mut XpbdScratch) {
+pub fn settle(bodies: &mut [Body], constraints: &[Slot<dyn Constraint>], s: &mut XpbdScratch) {
     for _ in 0..SETTLE_SWEEPS { project(bodies, constraints, &mut s.eval, None); }
 }
 
@@ -75,12 +76,12 @@ pub fn settle(bodies: &mut [Body], constraints: &[Box<dyn Constraint>], s: &mut 
 /// With `rec`, each constraint's impulse over the step (Jᵀ·Δλ/dt²) is
 /// recorded as a force.
 fn project(
-    bodies: &mut [Body], constraints: &[Box<dyn Constraint>], e: &mut ConstraintEval,
+    bodies: &mut [Body], constraints: &[Slot<dyn Constraint>], e: &mut ConstraintEval,
     mut rec: Option<(&mut Vec<Reaction>, f64)>,
 ) {
     if let Some((r, _)) = rec.as_mut() { r.clear(); }
     for c in constraints {
-        c.evaluate(bodies, false, e);
+        if c.on { c.evaluate(bodies, false, e); } else { e.n_blocks = 0; }
         let mut reaction = Reaction { n: e.n_blocks, ..Default::default() };
         if e.n_blocks == 0 {
             if let Some((r, _)) = rec.as_mut() { r.push(reaction); }

@@ -3,6 +3,7 @@ use crate::sim::body::Body;
 use crate::sim::constraint::{Constraint, ConstraintEval, Reaction};
 use crate::sim::contact::Contacts;
 use crate::sim::force::Force;
+use crate::sim::slot::Slot;
 use crate::sim::solver::WitkinSolver;
 use crate::sim::xpbd::{self, XpbdScratch};
 
@@ -31,8 +32,8 @@ pub enum Integrator {
 
 pub struct World {
     pub bodies: Vec<Body>,
-    pub constraints: Vec<Box<dyn Constraint>>,
-    pub forces: Vec<Box<dyn Force>>,
+    pub constraints: Vec<Slot<dyn Constraint>>,
+    pub forces: Vec<Slot<dyn Force>>,
     pub tracers: Vec<Tracer>,
     pub integrator: Integrator,
     /// Collisions between bodies with `collide` set, and their material.
@@ -74,11 +75,11 @@ impl World {
     }
 
     pub fn add_constraint(&mut self, c: impl Constraint + 'static) {
-        self.constraints.push(Box::new(c));
+        self.constraints.push(Slot::new(Box::new(c)));
     }
 
     pub fn add_force(&mut self, f: impl Force + 'static) {
-        self.forces.push(Box::new(f));
+        self.forces.push(Slot::new(Box::new(f)));
     }
 
     pub fn add_tracer(&mut self, body: usize, local: Vec2) {
@@ -106,7 +107,7 @@ impl World {
             }
             Integrator::Rk4 => self.rk4_step(dt),
         }
-        for c in self.constraints.iter_mut() { c.post_step(&self.bodies); }
+        for c in self.constraints.iter_mut().filter(|c| c.on) { c.post_step(&self.bodies); }
         self.contacts.post_step(&self.bodies, dt);
     }
 
@@ -144,9 +145,9 @@ impl World {
             .filter(|b| !b.fixed)
             .map(|b| b.mass as f64 * g as f64 * b.pos.y)
             .sum();
-        let elastic: f64 = self.forces.iter()
+        let elastic: f64 = self.forces.iter().filter(|f| f.on)
             .map(|f| f.potential_energy(&self.bodies))
-            .chain(self.constraints.iter().map(|c| c.potential_energy(&self.bodies)))
+            .chain(self.constraints.iter().filter(|c| c.on).map(|c| c.potential_energy(&self.bodies)))
             .sum();
         (grav + elastic) as f32
     }
@@ -154,7 +155,7 @@ impl World {
     pub fn constraint_error(&self) -> f32 {
         let mut e = ConstraintEval::default();
         let mut err = 0.0f64;
-        for c in &self.constraints {
+        for c in self.constraints.iter().filter(|c| c.on) {
             c.evaluate(&self.bodies, false, &mut e);
             err += e.c[..c.dim()].iter().map(|v| v * v).sum::<f64>();
         }
@@ -176,8 +177,8 @@ impl World {
 
         for stage in 0..4 {
             for b in self.bodies.iter_mut() { b.clear_accumulators(); }
-            for f in &self.forces { f.apply(&mut self.bodies); }
-            for c in &self.constraints { c.apply_forces(&mut self.bodies, dt); }
+            for f in self.forces.iter().filter(|f| f.on) { f.apply(&mut self.bodies); }
+            for c in self.constraints.iter().filter(|c| c.on) { c.apply_forces(&mut self.bodies, dt); }
             self.contacts.apply(&mut self.bodies, dt);
             self.solver.apply(&mut self.bodies, &self.constraints);
             if stage == 0 && self.record_reactions {

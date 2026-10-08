@@ -14,6 +14,7 @@
 
 use glam::DVec3;
 use crate::sim::body::Body;
+use crate::sim::slot::Slot;
 use crate::sim::constraint::{Constraint, ConstraintEval, Reaction};
 
 const KS: f64 = 150.0; // position feedback (Baumgarte)
@@ -55,12 +56,13 @@ pub struct WitkinSolver {
 impl WitkinSolver {
     /// Adds constraint forces to the bodies' force/torque accumulators, which
     /// must already hold the applied forces.
-    pub fn apply(&mut self, bodies: &mut [Body], constraints: &[Box<dyn Constraint>]) {
+    pub fn apply(&mut self, bodies: &mut [Body], constraints: &[Slot<dyn Constraint>]) {
         if constraints.is_empty() { return; }
 
         self.evals.resize(constraints.len(), ConstraintEval::default());
         for (c, e) in constraints.iter().zip(self.evals.iter_mut()) {
-            c.evaluate(bodies, true, e);
+            // Switched off: no rows, like a momentarily degenerate constraint.
+            if c.on { c.evaluate(bodies, true, e); } else { e.n_blocks = 0; }
         }
 
         self.w.clear();
@@ -94,7 +96,7 @@ impl WitkinSolver {
     }
 
     /// Jᵀλ per constraint and block from the last `apply`.
-    pub fn reactions(&self, constraints: &[Box<dyn Constraint>], out: &mut Vec<Reaction>) {
+    pub fn reactions(&self, constraints: &[Slot<dyn Constraint>], out: &mut Vec<Reaction>) {
         out.clear();
         for (ci, (c, e)) in constraints.iter().zip(&self.evals).enumerate() {
             let r0 = self.row_of.get(ci).copied().unwrap_or(0);
@@ -110,7 +112,7 @@ impl WitkinSolver {
     }
 
     /// Rebuilds ordering and envelope layout if the constraint graph changed.
-    fn sync_layout(&mut self, bodies: &[Body], constraints: &[Box<dyn Constraint>]) {
+    fn sync_layout(&mut self, bodies: &[Body], constraints: &[Slot<dyn Constraint>]) {
         self.sig_new.clear();
         self.sig_new.push(bodies.len());
         for (c, e) in constraints.iter().zip(&self.evals) {
@@ -204,7 +206,7 @@ impl WitkinSolver {
     fn at(&self, i: usize, j: usize) -> usize { self.start[i] + j - self.first[i] }
 
     /// A = JWJᵀ into the envelope (lower triangle), b = RHS into `x`.
-    fn assemble(&mut self, constraints: &[Box<dyn Constraint>]) {
+    fn assemble(&mut self, constraints: &[Slot<dyn Constraint>]) {
         self.a.fill(0.0);
         for (body, list) in self.body_cons.iter().enumerate() {
             let w = self.w[body];

@@ -25,7 +25,14 @@ pub struct Body {
     pub fixed: bool,
     /// Takes part in collisions (`contact.rs`).
     pub collide: bool,
+    /// Contact material: Coulomb friction and restitution (0 dead, 1
+    /// elastic). A pair uses √(μa·μb) and the larger restitution.
+    pub friction: f32,
+    pub restitution: f32,
 }
+
+pub const DEFAULT_FRICTION: f32 = 0.5;
+pub const DEFAULT_RESTITUTION: f32 = 0.3;
 
 /// A body's rotation, `(cos θ, sin θ)`, computed once and reused for every
 /// attachment point of that body.
@@ -60,6 +67,8 @@ impl Body {
             shape,
             fixed: false,
             collide: false,
+            friction: DEFAULT_FRICTION,
+            restitution: DEFAULT_RESTITUTION,
         }
     }
 

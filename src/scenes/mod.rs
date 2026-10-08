@@ -6,7 +6,7 @@ use crate::sim::{
         cylinder::{CylinderState, GasMode, Stroke}, slider::{COLLAR_HALF, STOP_W},
         Cylinder, DistanceConstraint, GearJoint, GearKind, PinJoint, PinWorld, Rope, SliderJoint,
     },
-    forces::{spring::SpringDamper, TorsionSpring},
+    forces::{spring::SpringDamper, Motor, TorsionSpring},
     world::World,
 };
 
@@ -166,8 +166,8 @@ pub static SCENES: &[SceneDef] = &[
         view_size:     [5.6, 3.8],
     },
     SceneDef {
-        name:          "Sandbox",
-        description:   "Build your own simulation  ·  press E to edit",
+        name:          "Untitled",
+        description:   "Empty  ·  drag parts in from the editor panel",
         build:         sandbox::build,
         camera_center: [0.0, 0.0],
         view_size:     [10.0, 6.0],
@@ -251,7 +251,7 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
     let mut pins: Vec<Vec2> = Vec::new();
 
     // 1. Springs (behind everything)
-    for f in &world.forces {
+    for f in world.forces.iter().filter(|f| f.on) {
         if let Some(sd) = f.as_any().downcast_ref::<SpringDamper>() {
             if sd.body_a < n && sd.body_b < n {
                 let pa = bodies[sd.body_a].world_point(sd.local_a);
@@ -267,7 +267,7 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
     }
 
     // 2. Anchors: world pins, Point bodies and any fixed body
-    for c in &world.constraints {
+    for c in world.constraints.iter().filter(|c| c.on) {
         if let Some(pw) = c.as_any().downcast_ref::<PinWorld>() {
             draw_pedestal(geo, pw.target, ceiling(pw.target));
             pins.push(pw.target);
@@ -308,7 +308,7 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
     }
 
     // Belts over their pulleys
-    for c in &world.constraints {
+    for c in world.constraints.iter().filter(|c| c.on) {
         if let Some(g) = c.as_any().downcast_ref::<GearJoint>() {
             if g.kind == GearKind::Belt && g.body_a < n && g.body_b < n {
                 draw_belt(geo, &bodies[g.body_a], &bodies[g.body_b]);
@@ -331,7 +331,7 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
     }
 
     // Ropes, over their pulleys
-    for c in &world.constraints {
+    for c in world.constraints.iter().filter(|c| c.on) {
         if let Some(r) = c.as_any().downcast_ref::<Rope>() {
             if r.body_a < n && r.body_b < n && r.pulley.is_none_or(|p| p < n) {
                 draw_rope(geo, r, bodies);
@@ -342,7 +342,7 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
     }
 
     // 6. Rails: a dark groove between two end stops, then the carriages
-    let sliders = || world.constraints.iter()
+    let sliders = || world.constraints.iter().filter(|c| c.on)
         .filter_map(|c| c.as_any().downcast_ref::<SliderJoint>())
         .filter(|sj| sj.rider < n && sj.rail < n);
     for sj in sliders() {
@@ -393,7 +393,7 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
     }
 
     // 8. Massless links and joint locations
-    for c in &world.constraints {
+    for c in world.constraints.iter().filter(|c| c.on) {
         let c = c.as_any();
         if let Some(dc) = c.downcast_ref::<DistanceConstraint>() {
             if dc.body_a < n && dc.body_b < n {
@@ -411,7 +411,7 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
     }
 
     // Torsion springs: a spiral that winds up with the twist
-    for f in &world.forces {
+    for f in world.forces.iter().filter(|f| f.on) {
         if let Some(t) = f.as_any().downcast_ref::<TorsionSpring>() {
             if t.body_a < n && t.body_b < n {
                 let p = bodies[t.body_a].world_point(t.local_a);
@@ -425,6 +425,65 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
     for p in pins {
         draw_pin(geo, p);
     }
+
+    // 10. Switched-off connections: a faint dashed trace of what they link
+    let off_constraints = world.constraints.iter().filter(|c| !c.on).map(|c| {
+        let any = c.as_any();
+        let end = any.downcast_ref::<PinWorld>().map(|pw| pw.target);
+        (c.body_indices(), end)
+    });
+    let off_forces = world.forces.iter().filter(|f| !f.on).map(|f| (f.body_indices(), None));
+    for (ids, end) in off_constraints.chain(off_forces) {
+        draw_switched_off(geo, bodies, &ids, end);
+    }
+
+    // 11. Motors: a turning arrow round the driven body's centre
+    let motors = world.forces.iter().filter(|f| f.on).filter_map(|f| f.as_any().downcast_ref::<Motor>());
+    for m in motors.filter(|m| m.body < n) {
+        draw_motor(geo, &bodies[m.body], m.torque);
+    }
+}
+
+/// A connection that is switched off: faint dashes between its bodies'
+/// centres (and to a world point `end`), or a faint ring on a lone body.
+fn draw_switched_off(geo: &mut GeometryBuilder, bodies: &[Body], ids: &[usize], end: Option<Vec2>) {
+    const OFF: [f32; 4] = [1.0, 1.0, 1.0, 0.3];
+    let mut pts: Vec<Vec2> = ids.iter().filter_map(|&i| bodies.get(i)).map(|b| b.pos32()).collect();
+    pts.extend(end);
+    match pts.as_slice() {
+        [] => {}
+        [p] => geo.draw_dashed_ring(*p, 0.16, 12, 0.014, OFF),
+        _ => for w in pts.windows(2) { geo.draw_dashed(w[0], w[1], 0.014, 0.06, 0.05, OFF); },
+    }
+}
+
+/// Motor hub radius: a little larger than a pin boss, which it covers.
+const MOTOR_R: f32 = 0.14;
+
+/// A driving motor on `b`, seen end-on: a dark rotor hub with a thin white
+/// rim, three white chevrons inside pointing the way the torque turns (they
+/// rotate with the body), and the axle as a white dot. Drag alone (a brake
+/// or load) drives nothing and isn't drawn.
+fn draw_motor(geo: &mut GeometryBuilder, b: &Body, torque: f32) {
+    if torque == 0.0 || matches!(b.shape, BodyShape::Point) { return; }
+    let c = b.pos32();
+    let dir = torque.signum();
+    geo.draw_circle(c, MOTOR_R + OUTLINE, 40, BG);
+    geo.draw_arc(c, MOTOR_R - 0.009, 0.0, std::f32::consts::TAU, 40, 0.018, WHITE);
+    let r = MOTOR_R * 0.6;
+    for k in 0..3 {
+        let a = b.angle32() + k as f32 * std::f32::consts::TAU / 3.0;
+        let radial = Vec2::new(a.cos(), a.sin());
+        let t = radial.perp() * dir; // the way this point travels
+        let p = c + radial * r;
+        let (len, half) = (0.032, 0.03);
+        let tip = p + t * len;
+        let back = p - t * len * 0.5;
+        // A chevron: two strokes meeting at the tip.
+        geo.draw_line(back + radial * half, tip, 0.016, WHITE);
+        geo.draw_line(back - radial * half, tip, 0.016, WHITE);
+    }
+    geo.draw_circle(c, 0.024, 16, WHITE);
 }
 
 // ── Gears, belts, ropes, torsion springs ─────────────────────────────────────
@@ -433,7 +492,7 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
 const TOOTH_PITCH: f32 = 0.11;
 const TOOTH_ADD:   f32 = 0.035;
 const TOOTH_DED:   f32 = 0.035;
-const BELT_W:      f32 = 0.035;
+const BELT_W:      f32 = crate::sim::constraints::gear::BELT_WIDTH as f32;
 const ROPE_W:      f32 = 0.022;
 
 fn tooth_count(radius: f32) -> u32 {
@@ -446,7 +505,7 @@ fn tooth_count(radius: f32) -> u32 {
 fn gear_phases(world: &World) -> Vec<Option<f32>> {
     let bodies = &world.bodies;
     let mut phase: Vec<Option<f32>> = vec![None; bodies.len()];
-    for c in &world.constraints {
+    for c in world.constraints.iter().filter(|c| c.on) {
         let Some(g) = c.as_any().downcast_ref::<GearJoint>() else { continue };
         if g.kind != GearKind::Mesh || g.body_a >= bodies.len() || g.body_b >= bodies.len() { continue; }
         let (a, b) = (g.body_a, g.body_b);
@@ -596,7 +655,7 @@ fn draw_torsion(geo: &mut GeometryBuilder, p: Vec2, angle: f32, twist: f32) {
 
 fn cylinders(world: &World) -> impl Iterator<Item = &Cylinder> {
     let n = world.bodies.len();
-    world.constraints.iter()
+    world.constraints.iter().filter(|c| c.on)
         .filter_map(|c| c.as_any().downcast_ref::<Cylinder>())
         .filter(move |cy| cy.piston < n && cy.barrel < n)
 }
@@ -890,7 +949,7 @@ fn force_sites(world: &World) -> Vec<(usize, usize, Vec2)> {
                 out.push((ci, r.body_b, pa + (pb - pa).normalize_or_zero() * ra));
             }
         } else if let Some(r) = any.downcast_ref::<crate::sim::constraints::RollingOnRod>() {
-            if r.disk < n && r.rod < n {
+            if r.on && r.disk < n && r.rod < n {
                 let rr = disk_r(&b[r.disk]).unwrap_or(0.0);
                 let (s, c) = b[r.rod].angle32().sin_cos();
                 let m = Vec2::new(-s, c);

@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::f64::consts::{PI, TAU};
+use glam::DVec2;
 use crate::sim::body::Body;
 use crate::sim::constraint::{Constraint, ConstraintEval};
 use super::rolling_contact::disk_radius;
@@ -34,7 +35,30 @@ pub struct GearJoint {
     pub body_a: usize,
     pub body_b: usize,
     pub kind: GearKind,
+    /// Belts only: bodies with `collide` hit the belt (a conveyor), see
+    /// `contact.rs`.
+    pub collide: bool,
     k: f64,
+}
+
+/// Belt thickness: drawn this wide, and the collision capsule's diameter.
+pub const BELT_WIDTH: f64 = 0.035;
+
+/// The two straight runs of an open belt round disks `a` and `b`, along
+/// the belt's centre line, each from its tangent point on `a` to the one on
+/// `b`. `None` if one pulley sits inside the other.
+pub fn belt_strands(a: &Body, b: &Body) -> Option<[(DVec2, DVec2); 2]> {
+    let ra = disk_radius(a)? + 0.5 * BELT_WIDTH;
+    let rb = disk_radius(b)? + 0.5 * BELT_WIDTH;
+    let d = b.pos - a.pos;
+    let len = d.length();
+    if len <= (ra - rb).abs() + 1e-4 { return None; }
+    let base = d.y.atan2(d.x);
+    let gamma = ((ra - rb) / len).clamp(-1.0, 1.0).acos();
+    Some([base - gamma, base + gamma].map(|phi| {
+        let u = DVec2::new(phi.cos(), phi.sin());
+        (a.pos + u * ra, b.pos + u * rb)
+    }))
 }
 
 /// Below this centre distance the line of centres is ignored.
@@ -51,7 +75,7 @@ impl GearJoint {
         if body_a == body_b { return None; }
         disk_radius(&bodies[body_a])?;
         disk_radius(&bodies[body_b])?;
-        let mut g = Self { body_a, body_b, kind, k: 0.0 };
+        let mut g = Self { body_a, body_b, kind, collide: false, k: 0.0 };
         g.rebase(bodies);
         Some(g)
     }

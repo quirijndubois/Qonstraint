@@ -4,6 +4,7 @@ pub mod constraints;
 pub mod contact;
 pub mod force;
 pub mod forces;
+pub mod slot;
 pub mod solver;
 pub mod world;
 pub mod xpbd;

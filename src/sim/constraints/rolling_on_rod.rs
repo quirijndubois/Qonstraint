@@ -13,16 +13,20 @@ use super::rolling_contact::disk_radius;
 ///
 /// Row 1 says the distance travelled along the rod equals the arc rolled
 /// relative to the rod, so the disk's rotation is locked to its position.
-/// The rod is treated as an infinite line: the disk stays on its face even
-/// past the ends.
+/// Once the contact point rolls past an end of the rod (|u·d| > half
+/// length) the constraint lets go and the disk falls; it takes hold again
+/// (re-capturing `k`) if the disk comes back onto the same face within the
+/// rod's length. Checked in `post_step`, so it never changes mid-step.
 pub struct RollingOnRod {
     pub disk: usize,
     pub rod:  usize,
     side: f64,
     k:    f64,
+    /// The disk is on the rod (false once it has rolled off an end).
+    pub on: bool,
 }
 
-struct Frame { u: DVec2, m: DVec2, d: DVec2, r: f64, w: f64 }
+struct Frame { u: DVec2, m: DVec2, d: DVec2, r: f64, w: f64, half_len: f64 }
 
 impl RollingOnRod {
     /// `None` unless `disk` is a disk and `rod` a rod. The side is taken from
@@ -30,7 +34,7 @@ impl RollingOnRod {
     pub fn new(disk: usize, rod: usize, bodies: &[Body]) -> Option<Self> {
         disk_radius(&bodies[disk])?;
         let BodyShape::Rod { .. } = bodies[rod].shape else { return None };
-        let mut c = Self { disk, rod, side: 1.0, k: 0.0 };
+        let mut c = Self { disk, rod, side: 1.0, k: 0.0, on: true };
         let f = c.frame(bodies);
         c.side = if f.m.dot(f.d) < 0.0 { -1.0 } else { 1.0 };
         c.rebase(bodies);
@@ -41,8 +45,27 @@ impl RollingOnRod {
         let (disk, rod) = (&bodies[self.disk], &bodies[self.rod]);
         let (s, c) = rod.angle.sin_cos();
         let u = DVec2::new(c, s);
-        let w = match rod.shape { BodyShape::Rod { half_width, .. } => half_width as f64, _ => 0.0 };
-        Frame { u, m: u.perp(), d: disk.pos - rod.pos, r: disk_radius(disk).unwrap_or(0.0), w }
+        let (half_len, w) = match rod.shape {
+            BodyShape::Rod { half_len, half_width } => (half_len as f64, half_width as f64),
+            _ => (0.0, 0.0),
+        };
+        Frame { u, m: u.perp(), d: disk.pos - rod.pos, r: disk_radius(disk).unwrap_or(0.0), w, half_len }
+    }
+
+    /// The contact point lies within the rod's length.
+    fn within(f: &Frame) -> bool {
+        f.u.dot(f.d).abs() <= f.half_len
+    }
+
+    /// The disk touches (or presses into) its face from its own side.
+    fn touching(&self, f: &Frame) -> bool {
+        let gap = self.side * f.m.dot(f.d) - (f.r + f.w);
+        Self::within(f) && gap <= 0.0 && gap > -f.r
+    }
+
+    fn capture_k(&mut self, bodies: &[Body], f: &Frame) {
+        let rel_angle = bodies[self.disk].angle - bodies[self.rod].angle;
+        self.k = f.u.dot(f.d) + self.side * f.r * rel_angle;
     }
 }
 
@@ -52,6 +75,10 @@ impl Constraint for RollingOnRod {
     fn dim(&self) -> usize { 2 }
 
     fn evaluate(&self, bodies: &[Body], vel: bool, out: &mut ConstraintEval) {
+        if !self.on {
+            out.n_blocks = 0;
+            return;
+        }
         let f = self.frame(bodies);
         let s = self.side;
         let (u, m, d) = (f.u, f.m, f.d);
@@ -83,8 +110,32 @@ impl Constraint for RollingOnRod {
 
     fn rebase(&mut self, bodies: &[Body]) {
         let f = self.frame(bodies);
-        let rel_angle = bodies[self.disk].angle - bodies[self.rod].angle;
-        self.k = f.u.dot(f.d) + self.side * f.r * rel_angle;
+        // Editor moves put the disk wherever it was dropped: on the rod if
+        // that's within its length (it is pulled onto the face), else off.
+        self.on = Self::within(&f);
+        self.capture_k(bodies, &f);
+    }
+
+    fn post_step(&mut self, bodies: &[Body]) {
+        let f = self.frame(bodies);
+        if self.on {
+            if !Self::within(&f) { self.on = false; }
+        } else if self.touching(&f) {
+            self.on = true;
+            self.capture_k(bodies, &f);
+        }
+    }
+
+    fn save_state(&self, out: &mut Vec<f64>) {
+        out.push(if self.on { 1.0 } else { 0.0 });
+        out.push(self.k);
+    }
+
+    fn load_state(&mut self, input: &mut &[f64]) {
+        let Some(([on, k], rest)) = input.split_first_chunk::<2>() else { return };
+        self.on = *on != 0.0;
+        self.k = *k;
+        *input = rest;
     }
 
     fn body_indices(&self) -> Vec<usize> { vec![self.disk, self.rod] }
@@ -166,5 +217,37 @@ mod tests {
         eprintln!("{integ:?} C={c:?} rod θ={} disk pos={:?}", w.bodies[r].angle, w.bodies[d].pos);
         assert!(c[0].abs() < 1e-3 && c[1].abs() < 1e-3);
         assert!(w.bodies[r].angle32().abs() > 0.05, "rod should react to the disk");
+    }
+
+    /// Rolling down a fixed incline, the disk leaves the rod at its lower end
+    /// and falls freely below it; a rewind before that puts it back on.
+    #[test]
+    fn falls_off_the_end() { for i in BOTH { falls_off_the_end_with(i) } }
+
+    fn falls_off_the_end_with(integ: Integrator) {
+        let alpha = 0.3f32;
+        let mut w = World::new();
+        w.integrator = integ;
+        let r = w.add_body(rod(Vec2::ZERO, -alpha).fixed());
+        let m = Vec2::new(alpha.sin(), alpha.cos());
+        let d = w.add_body(disk_at(m * (R + W)));
+        w.add_constraint(RollingOnRod::new(d, r, &w.bodies).unwrap());
+        w.add_force(Gravity::new(9.81));
+        let mut saved = Vec::new();
+        w.save_state(&mut saved);
+
+        for _ in 0..4000 { w.step(0.001); }
+
+        let on = w.constraints[0].as_any().downcast_ref::<RollingOnRod>().unwrap().on;
+        let p = w.bodies[d].pos32();
+        eprintln!("{integ:?} on={on} disk at {p:?}");
+        assert!(!on, "should have rolled off");
+        // Past the lower end, well below where the rod's face would be.
+        let end_y = -2.0 * alpha.sin();
+        assert!(p.y < end_y - 1.0, "should be falling, at {p:?}");
+
+        w.load_state(&saved);
+        let on = w.constraints[0].as_any().downcast_ref::<RollingOnRod>().unwrap().on;
+        assert!(on, "rewind restores the contact");
     }
 }

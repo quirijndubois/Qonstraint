@@ -1,6 +1,7 @@
 mod analysis;
 mod app;
 mod editor;
+mod library;
 mod renderer;
 mod scene_file;
 mod scenes;
@@ -114,6 +115,10 @@ fn main() {
     }
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
+    // In the browser `request_redraw` already runs a frame per animation
+    // frame; polling there only floods the main thread with wake-ups, which
+    // starves Firefox's animation frames.
+    #[cfg(not(target_arch = "wasm32"))]
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let proxy = event_loop.create_proxy();
     #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]

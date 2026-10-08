@@ -8,6 +8,7 @@ use winit::{
 };
 
 use crate::analysis::{Analysis, Butterfly, UndoStack};
+use crate::library::{self, Library, Source, Tile};
 use crate::scene_file::SceneFile;
 use crate::editor::{
     connection_handles, move_handle, snap_point, BodyEdit, ConstraintKind, Editor, EditorMode,
@@ -32,6 +33,15 @@ use crate::sim::{
 const MAX_AUTO_STEPS: f32 = 1_000_000.0;
 /// Trace samples per second of trail (one sample per rendered frame).
 const TRACE_FPS: f32 = 60.0;
+/// Editor selection and handles: sky blue, so they read on white parts and
+/// on the dark background alike.
+const SELECT: [f32; 4] = [0.40, 0.78, 1.0, 1.0];
+const SELECT_FAINT: [f32; 4] = [0.40, 0.78, 1.0, 0.5];
+/// Gallery thumbnail size in pixels (drawn at 2× its on-screen size).
+const THUMB_PX: [u32; 2] = [400, 250];
+
+/// The empty scene NEW starts; the last in `SCENES`, left out of the gallery.
+fn empty_scene() -> usize { SCENES.len() - 1 }
 
 /// Overlay scale that follows the largest value on show: up at once (so
 /// nothing overflows), down slowly (so it doesn't flicker).
@@ -41,6 +51,24 @@ fn smooth_scale(current: f32, max: f32) -> f32 {
 }
 
 /// Zoom (world units per pixel) that fits `view` (world w × h) in `screen`.
+/// Centre and size framing every body of `world`, with a margin.
+fn bodies_view(world: &World) -> (Vec2, [f32; 2]) {
+    let mut lo = Vec2::splat(f32::INFINITY);
+    let mut hi = Vec2::splat(f32::NEG_INFINITY);
+    for b in &world.bodies {
+        let r = match b.shape {
+            BodyShape::Disk { radius } => radius,
+            BodyShape::Rod { half_len, half_width } => half_len + half_width,
+            BodyShape::Point => 0.2,
+        };
+        lo = lo.min(b.pos32() - Vec2::splat(r));
+        hi = hi.max(b.pos32() + Vec2::splat(r));
+    }
+    if !lo.is_finite() { return (Vec2::ZERO, [10.0, 6.0]); }
+    let size = (hi - lo) * 1.3 + Vec2::splat(0.5);
+    ((lo + hi) * 0.5, [size.x, size.y])
+}
+
 fn fit_scale(view: [f32; 2], screen: Vec2) -> f32 {
     (view[0] / screen.x.max(1.0)).max(view[1] / screen.y.max(1.0))
 }
@@ -98,6 +126,16 @@ pub struct App {
     /// view it was shared with, which replaces the scene's for fitting.
     custom: Option<String>,
     custom_view: Option<[f32; 2]>,
+    /// Wheel zoom still to apply, as ln(scale factor); eased in per frame.
+    zoom_pending: f32,
+    /// Editor clipboard: a scene file of the copied bodies (Ctrl+C / X / V).
+    clipboard: Option<SceneFile>,
+    /// Library name of a loaded saved scene (`None`: a share code).
+    custom_name: Option<String>,
+    library: Library,
+    /// Build the gallery tiles at the start of the next frame: thumbnails
+    /// share the renderer's buffers, so they can't be drawn mid-frame.
+    gallery_pending: bool,
     #[cfg(target_arch = "wasm32")]
     last_hash: String,
 }
@@ -154,10 +192,16 @@ impl App {
             load_scale: 1.0,
             custom: None,
             custom_view: None,
+            custom_name: None,
+            clipboard: None,
+            zoom_pending: 0.0,
+            library: Library::default(),
+            gallery_pending: false,
             #[cfg(target_arch = "wasm32")]
             last_hash: String::new(),
         };
         app.undo.reset(&app.world);
+        app.refresh_saved();
         #[cfg(target_arch = "wasm32")]
         app.check_url_hash();
         app
@@ -186,17 +230,29 @@ impl App {
         }
     }
 
-    /// The current world as a share code, with the camera's view.
-    fn share_code(&self) -> String {
+    /// The current world with the camera's view.
+    fn scene_file(&self) -> SceneFile {
         let mut file = SceneFile::from_world(&self.world);
         let screen = self.screen_size() * self.camera.scale;
         file.view = Some([self.camera.center.x, self.camera.center.y, screen.x, screen.y]);
-        file.to_code()
+        file
+    }
+
+    /// The current world as a share code, with the camera's view.
+    fn share_code(&self) -> String {
+        self.scene_file().to_code()
     }
 
     /// Load a share code (or link). False if it doesn't decode.
     fn load_code(&mut self, code: &str) -> bool {
         let Some(file) = SceneFile::from_code(code) else { return false };
+        self.load_file(&file, None);
+        true
+    }
+
+    /// Show a scene file (a share code, or the saved scene `name`); RESET
+    /// reloads it.
+    fn load_file(&mut self, file: &SceneFile, name: Option<String>) {
         self.replace_world(file.to_world());
         if let Some([cx, cy, w, h]) = file.view {
             self.camera.center = Vec2::new(cx, cy);
@@ -205,10 +261,84 @@ impl App {
             self.camera_fitted = true;
         }
         self.custom = Some(file.to_json());
+        self.custom_name = name;
         self.undo.reset(&self.world);
         self.editor.active = false;
         self.editor.paused = false;
-        true
+    }
+
+    /// SAVE: keep the current world (as it is now, with the view) in the
+    /// library; it becomes the scene RESET returns to.
+    fn save_scene(&mut self, name: String) {
+        let file = self.scene_file();
+        let json = file.to_json();
+        match library::save(&name, &json) {
+            Ok(()) => {
+                if let Some([_, _, w, h]) = file.view { self.custom_view = Some([w, h]); }
+                self.custom = Some(json);
+                self.custom_name = Some(name);
+                self.library.show_save = false;
+                self.refresh_saved();
+            }
+            Err(e) => self.library.save_note = format!("Not saved: {e}"),
+        }
+    }
+
+    fn load_saved(&mut self, name: &str) {
+        let Some(file) = library::list().into_iter()
+            .find(|s| s.name == name)
+            .and_then(|s| SceneFile::from_json(&s.json))
+        else { return };
+        self.load_file(&file, Some(name.to_owned()));
+    }
+
+    /// Re-read the saved names, and redraw the gallery's saved tiles if it
+    /// has been built.
+    fn refresh_saved(&mut self) {
+        self.library.saved_names = library::list().into_iter().map(|s| s.name).collect();
+        if !self.library.tiles.is_empty() { self.gallery_pending = true; }
+    }
+
+    /// Gallery tiles: every built-in scene but the empty one (built once),
+    /// then the saved scenes (rebuilt each time).
+    fn build_gallery(&mut self) {
+        let mut tiles = std::mem::take(&mut self.library.tiles);
+        tiles.retain(|t| {
+            let keep = matches!(t.source, Source::Builtin(_));
+            if !keep { self.hud.free_texture(t.thumb); }
+            keep
+        });
+        if tiles.is_empty() {
+            for (i, def) in SCENES.iter().enumerate().take(empty_scene()) {
+                let world = (def.build)();
+                let thumb = self.thumbnail(&world, Vec2::from(def.camera_center), def.view_size);
+                tiles.push(Tile { source: Source::Builtin(i), name: def.name.into(), desc: def.description.into(), thumb });
+            }
+        }
+        let saved = library::list();
+        self.library.saved_names = saved.iter().map(|s| s.name.clone()).collect();
+        for s in saved {
+            let Some(file) = SceneFile::from_json(&s.json) else { continue };
+            let world = file.to_world();
+            let (center, view) = match file.view {
+                Some([cx, cy, w, h]) => (Vec2::new(cx, cy), [w, h]),
+                None => bodies_view(&world),
+            };
+            let thumb = self.thumbnail(&world, center, view);
+            tiles.push(Tile { source: Source::Saved(s.name.clone()), name: s.name, desc: String::new(), thumb });
+        }
+        self.library.tiles = tiles;
+    }
+
+    /// Draw `world` (as `draw_world` does on screen) into a texture egui can show.
+    fn thumbnail(&mut self, world: &World, center: Vec2, view: [f32; 2]) -> egui::TextureId {
+        let mut geo = GeometryBuilder::new();
+        crate::scenes::draw_world(world, crate::scenes::free_com_y(world), &[], &mut geo);
+        let mut camera = Camera::new();
+        camera.center = center;
+        camera.scale = fit_scale(view, Vec2::new(THUMB_PX[0] as f32, THUMB_PX[1] as f32));
+        let tex = self.render_state.render_to_texture(&camera, &geo, THUMB_PX[0], THUMB_PX[1]);
+        self.hud.register_texture(&self.render_state.device, &tex)
     }
 
     /// In the browser a share link carries the scene in `#s=…`; load it at
@@ -272,7 +402,73 @@ impl App {
 
     /// While the simulation runs in edit mode, a body being dragged, turned
     /// or resized stays where the editor puts it instead of flying off.
+    /// Bodies whose centres lie in the box with corners `a`, `b`.
+    fn bodies_in_box(&self, a: Vec2, b: Vec2) -> Vec<usize> {
+        let (lo, hi) = (a.min(b), a.max(b));
+        self.world.bodies.iter().enumerate()
+            .filter(|(_, body)| {
+                let p = body.pos32();
+                p.cmpge(lo).all() && p.cmple(hi).all()
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Select these bodies: none clears, one opens the inspector, more
+    /// make a group.
+    fn select(&mut self, mut bodies: Vec<usize>) {
+        bodies.retain(|&i| i < self.world.bodies.len());
+        bodies.sort_unstable();
+        bodies.dedup();
+        self.editor.body_edit = None;
+        self.editor.inspect_shape = None;
+        match bodies.len() {
+            0 => self.editor.mode = EditorMode::Idle,
+            1 => self.inspect_body(bodies[0]),
+            _ => self.editor.mode = EditorMode::Selection,
+        }
+        self.editor.selection = bodies;
+    }
+
+    /// Ctrl+C: the selected bodies and what links only them. False if
+    /// nothing is selected.
+    fn copy_selected(&mut self) -> bool {
+        let Some(file) = crate::scene_file::extract(&self.world, &self.editor.selected_bodies()) else { return false };
+        self.clipboard = Some(file);
+        self.editor.can_paste = true;
+        true
+    }
+
+    /// Ctrl+V: the clipboard, centred on the cursor, selected so it can be
+    /// dragged into place.
+    fn paste(&mut self) {
+        let Some(file) = &self.clipboard else { return };
+        let at = self.editor_point(None);
+        let ids = crate::scene_file::paste_into(&mut self.world, file, at);
+        if !self.editor.paused { self.world.rebase(); }
+        self.select(ids);
+    }
+
+    fn delete_selected(&mut self) {
+        let ids = self.editor.selected_bodies();
+        if ids.is_empty() { return; }
+        self.editor.delete_bodies(&ids, &mut self.world);
+        self.editor.mode = EditorMode::Idle;
+        self.editor.selection.clear();
+        self.editor.body_edit = None;
+        self.editor.inspect_shape = None;
+    }
+
     fn hold_grabbed_body(&mut self) {
+        if let EditorMode::GroupDragging { .. } = self.editor.mode {
+            for &i in &self.editor.selection {
+                if let Some(b) = self.world.bodies.get_mut(i) {
+                    b.vel = glam::DVec2::ZERO;
+                    b.ang_vel = 0.0;
+                }
+            }
+            return;
+        }
         let idx = match self.editor.mode {
             EditorMode::Dragging { body_idx }
             | EditorMode::Rotating { body_idx, .. }
@@ -329,6 +525,7 @@ impl App {
         let def = &SCENES[idx];
         self.camera.center = Vec2::from(def.camera_center);
         self.camera_fitted = true;
+        self.zoom_pending = 0.0;
         self.camera.scale  = fit_scale(def.view_size, self.screen_size());
         self.traces.clear();
         self.mouse_spring.lock().unwrap().active = false;
@@ -338,6 +535,7 @@ impl App {
         self.anchor_ref_y = crate::scenes::free_com_y(&self.world);
         self.custom = None;
         self.custom_view = None;
+        self.custom_name = None;
         self.analysis.timeline.clear();
         self.analysis.butterfly = None;
         self.analysis.phase.clear();
@@ -356,7 +554,7 @@ impl App {
         // The sandbox opens in edit mode; switching to any other scene
         // returns to simulating. A reset keeps whichever mode (and pause
         // state) you were in.
-        let sandbox = idx == SCENES.len() - 1;
+        let sandbox = idx == empty_scene();
         if sandbox || switching {
             self.editor.active = sandbox;
             self.editor.paused = sandbox;
@@ -530,6 +728,9 @@ impl App {
                 // Clicks in viewport ignored while picker is open
             }
 
+            // Box selection and group moves are handled on press / release.
+            EditorMode::Selection | EditorMode::BoxSelecting { .. } | EditorMode::GroupDragging { .. } => {}
+
             EditorMode::PinWorldPending { body_idx, attach } => {
                 let k = self.editor.spring_k;
                 let d = self.editor.spring_d;
@@ -572,6 +773,11 @@ impl App {
         if let WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } = event {
             self.left_down = false;
         }
+        // Track the cursor over the HUD too, so a part dragged out of the
+        // palette follows it.
+        if let WindowEvent::CursorMoved { position, .. } = event {
+            self.mouse_pos = Vec2::new(position.x as f32, position.y as f32);
+        }
         if self.hud.on_window_event(self.window, event) {
             return true;
         }
@@ -585,12 +791,20 @@ impl App {
                             self.toggle_editor();
                         }
                         PhysicalKey::Code(KeyCode::Delete) | PhysicalKey::Code(KeyCode::Backspace) => {
-                            if self.editor.active {
-                                if let EditorMode::Inspecting { body_idx } = self.editor.mode {
-                                    self.editor.delete_body(body_idx, &mut self.world);
-                                    self.editor.mode = EditorMode::Idle;
-                                }
-                            }
+                            if self.editor.active { self.delete_selected(); }
+                        }
+                        PhysicalKey::Code(KeyCode::KeyC) if self.editor.active && self.ctrl_held => {
+                            self.copy_selected();
+                        }
+                        PhysicalKey::Code(KeyCode::KeyX) if self.editor.active && self.ctrl_held => {
+                            if self.copy_selected() { self.delete_selected(); }
+                        }
+                        PhysicalKey::Code(KeyCode::KeyV) if self.editor.active && self.ctrl_held => {
+                            self.paste();
+                        }
+                        PhysicalKey::Code(KeyCode::KeyA) if self.editor.active && self.ctrl_held => {
+                            let all: Vec<usize> = (0..self.world.bodies.len()).collect();
+                            self.select(all);
                         }
                         PhysicalKey::Code(KeyCode::Space) => {
                             self.editor.paused = !self.editor.paused;
@@ -616,6 +830,7 @@ impl App {
                         PhysicalKey::Code(KeyCode::Escape) => {
                             if self.editor.active {
                                 self.editor.mode = EditorMode::Idle;
+                                self.editor.selection.clear();
                             }
                         }
                         _ => {}
@@ -658,6 +873,15 @@ impl App {
                         EditorMode::DraggingHandle { handle, .. } => {
                             let wp = self.editor_point(None);
                             move_handle(&mut self.world, handle, wp);
+                        }
+                        EditorMode::GroupDragging { last, start, body } => {
+                            let wp = self.world_mouse();
+                            let d = (wp - last).as_dvec2();
+                            for i in self.editor.selection.clone() {
+                                if let Some(b) = self.world.bodies.get_mut(i) { b.pos += d; }
+                                crate::editor::sync_world_pins(&mut self.world, i);
+                            }
+                            self.editor.mode = EditorMode::GroupDragging { last: wp, start, body };
                         }
                         EditorMode::Resizing { body_idx, kind } if body_idx < self.world.bodies.len() => {
                             let wp = self.world_mouse();
@@ -705,6 +929,13 @@ impl App {
                                         return false;
                                     }
                                 }
+                                // Pressing a body of the group moves the group.
+                                if !self.shift_held && matches!(self.editor.mode, EditorMode::Selection) {
+                                    if let Some(idx) = self.pick_body(wp).map(|(i, _)| i).filter(|i| self.editor.selection.contains(i)) {
+                                        self.editor.mode = EditorMode::GroupDragging { last: wp, start: wp, body: idx };
+                                        return false;
+                                    }
+                                }
                                 // In body-moveable modes without shift: record a drag candidate.
                                 // The candidate becomes a real drag on movement, or a click on release.
                                 if !self.shift_held
@@ -721,6 +952,14 @@ impl App {
                                         return false; // wait to see if it's a drag or click
                                     }
                                 }
+                                // Empty space: start a box selection.
+                                if !self.shift_held
+                                    && matches!(self.editor.mode, EditorMode::Idle | EditorMode::Inspecting { .. } | EditorMode::Selection)
+                                    && self.pick_body(wp).is_none()
+                                {
+                                    self.editor.mode = EditorMode::BoxSelecting { start: wp };
+                                    return false;
+                                }
                                 let at = self.editor_point(None);
                                 self.editor_click(wp, at);
                             } else if let Some((idx, local)) = self.pick_body(wp) {
@@ -736,6 +975,16 @@ impl App {
                             if self.editor.active {
                                 if let Some(cand) = self.drag_candidate.take() {
                                     self.inspect_body(cand);
+                                } else if let EditorMode::BoxSelecting { start } = self.editor.mode {
+                                    let inside = self.bodies_in_box(start, wp);
+                                    self.select(inside);
+                                } else if let EditorMode::GroupDragging { start, body, .. } = self.editor.mode {
+                                    if (wp - start).length() < 4.0 * self.camera.scale {
+                                        self.inspect_body(body);
+                                    } else {
+                                        if !self.editor.paused { self.world.rebase(); }
+                                        self.editor.mode = EditorMode::Selection;
+                                    }
                                 } else if let EditorMode::Dragging { body_idx }
                                     | EditorMode::DraggingHandle { body_idx, .. }
                                     | EditorMode::Rotating { body_idx, .. }
@@ -756,16 +1005,16 @@ impl App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let scroll = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => *y,
-                    MouseScrollDelta::PixelDelta(p)   => p.y as f32 * 0.01,
-                };
-                let factor = if scroll > 0.0 {
-                    0.9f32.powf(scroll)
-                } else {
-                    1.0 / 0.9f32.powf(-scroll)
-                };
-                self.camera.zoom(factor, self.mouse_pos, self.screen_size());
+                // A wheel notch (or more) eases in over a few frames
+                // (`ease_zoom`); trackpad scrolling is already fine-grained.
+                let ln_step = -(0.9f32.ln()); // ln of one notch: 10% per notch
+                match delta {
+                    MouseScrollDelta::LineDelta(_, y) => self.zoom_pending -= y * ln_step,
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let factor = (-(p.y as f32) * 0.01 * ln_step).exp();
+                        self.camera.zoom(factor, self.mouse_pos, self.screen_size());
+                    }
+                }
                 self.camera_fitted = false;
             }
             _ => {}
@@ -773,9 +1022,21 @@ impl App {
         false
     }
 
+    /// Apply part of the pending wheel zoom, towards the cursor: about 90 %
+    /// of what's left goes in each 0.12 s.
+    fn ease_zoom(&mut self, dt: f32) {
+        if self.zoom_pending == 0.0 { return; }
+        let k = 1.0 - (-dt * 19.0).exp();
+        let mut step = self.zoom_pending * k;
+        if self.zoom_pending.abs() < 1e-3 { step = self.zoom_pending; }
+        self.zoom_pending -= step;
+        self.camera.zoom(step.exp(), self.mouse_pos, self.screen_size());
+    }
+
     pub fn update(&mut self) {
         let now = web_time::Instant::now();
         let frame_time = (now - self.last_frame).as_secs_f32();
+        self.ease_zoom(frame_time.min(0.1));
         let dt  = frame_time.min(0.05);
         self.last_frame = now;
 
@@ -850,6 +1111,14 @@ impl App {
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let idx = self.current_scene_idx;
 
+        if self.gallery_pending {
+            self.gallery_pending = false;
+            self.build_gallery();
+        }
+
+        self.editor.connect_ready = self.editor.active && self.shift_held
+            && matches!(self.editor.mode, EditorMode::Idle | EditorMode::Inspecting { .. });
+
         // Build geometry
         self.geo.clear();
         if self.editor.active {
@@ -901,13 +1170,17 @@ impl App {
             constraint_error: err,
         };
 
-        let scene_count = SCENES.len();
         let def         = &SCENES[idx];
         let size        = [self.window_size.width, self.window_size.height];
-        let (name, desc) = if self.custom.is_some() {
-            ("Shared Scene", "Loaded from a share code  ·  RESET reloads it")
-        } else {
-            (def.name, def.description)
+        let (name, desc) = match (&self.custom, &self.custom_name) {
+            (Some(_), Some(n)) => (n.clone(), "Saved scene  ·  RESET reloads it"),
+            (Some(_), None) => ("Shared Scene".to_owned(), "Loaded from a share code  ·  RESET reloads it"),
+            _ => (def.name.to_owned(), def.description),
+        };
+        self.library.current = match (&self.custom, &self.custom_name) {
+            (Some(_), Some(n)) => Some(Source::Saved(n.clone())),
+            (Some(_), None) => None,
+            (None, _) => Some(Source::Builtin(idx)),
         };
         let undo_state = UndoState { can_undo: self.undo.can_undo(), can_redo: self.undo.can_redo() };
 
@@ -919,16 +1192,22 @@ impl App {
             &surface_view,
             size,
             &metrics,
-            idx,
-            scene_count,
-            name,
+            &name,
             desc,
             &mut self.editor,
             &mut self.world,
             &mut self.analysis,
             undo_state,
+            &mut self.library,
         );
         self.handle_analysis(&hud_out);
+
+        // A part dragged out of the palette and released over the scene.
+        if hud_out.drop_part && matches!(self.editor.mode, EditorMode::PlacingBody) {
+            let at = self.editor_point(None);
+            let idx = self.editor.place_body(at, &mut self.world);
+            self.inspect_body(idx);
+        }
 
         // Handle pending constraint from editor panel
         if let Some(kind) = self.editor.pending_constraint.take() {
@@ -976,12 +1255,7 @@ impl App {
         // Handle delete request from editor panel
         if self.editor.delete_requested {
             self.editor.delete_requested = false;
-            if let EditorMode::Inspecting { body_idx } = self.editor.mode {
-                self.editor.delete_body(body_idx, &mut self.world);
-                self.editor.mode = EditorMode::Idle;
-                self.editor.body_edit = None;
-                self.editor.inspect_shape = None;
-            }
+            self.delete_selected();
         }
 
         // Process scene navigation
@@ -999,18 +1273,44 @@ impl App {
                 None => self.load_scene(idx),
             }
             self.editor.gravity = g;
-        } else if hud_out.next_scene {
-            let next = (idx + 1) % scene_count;
-            self.load_scene(next);
-        } else if hud_out.prev_scene {
-            let prev = (idx + scene_count - 1) % scene_count;
-            self.load_scene(prev);
+        } else if hud_out.new_scene {
+            self.load_scene(empty_scene());
+        } else if let Some(source) = &hud_out.load {
+            match source {
+                Source::Builtin(i) => self.load_scene(*i),
+                Source::Saved(name) => self.load_saved(name),
+            }
         }
+        if let Some((i, toggle)) = hud_out.select_body {
+            let mut ids = if toggle { self.editor.selected_bodies() } else { Vec::new() };
+            match ids.iter().position(|&j| j == i) {
+                Some(k) if toggle => { ids.remove(k); }
+                _ => ids.push(i),
+            }
+            self.select(ids);
+        }
+        if hud_out.copy { self.copy_selected(); }
+        if hud_out.cut && self.copy_selected() { self.delete_selected(); }
+        if hud_out.paste {
+            // From the button the cursor is on the panel: paste mid-view.
+            let ids = match &self.clipboard {
+                Some(file) => crate::scene_file::paste_into(&mut self.world, file, self.camera.center),
+                None => Vec::new(),
+            };
+            if !ids.is_empty() && !self.editor.paused { self.world.rebase(); }
+            self.select(ids);
+        }
+        if let Some(name) = hud_out.save_as.clone() { self.save_scene(name); }
+        if let Some(name) = &hud_out.delete_saved {
+            library::delete(name);
+            self.refresh_saved();
+        }
+        if hud_out.open_gallery { self.gallery_pending = true; }
 
         // Undo snapshots: whenever a paused edit has settled (no button
         // held in the scene or on a slider), record it if anything changed.
         if self.editor.active && self.editor.paused && !self.left_down && !hud_out.pointer_busy
-            && matches!(self.editor.mode, EditorMode::Idle | EditorMode::Inspecting { .. })
+            && matches!(self.editor.mode, EditorMode::Idle | EditorMode::Inspecting { .. } | EditorMode::Selection)
         {
             self.undo.commit(&self.world);
         }
@@ -1058,9 +1358,9 @@ impl App {
     /// CAD-style corner brackets for selection, red for the second pick,
     /// reticles on attach points, translucent ghosts for placement.
     fn draw_editor_overlay(&mut self) {
-        const SEL:   [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+        const SEL:   [f32; 4] = SELECT;
         const SEL_B: [f32; 4] = [0.90, 0.27, 0.22, 1.0];
-        const HOVER: [f32; 4] = [1.0, 1.0, 1.0, 0.35];
+        const HOVER: [f32; 4] = [SELECT[0], SELECT[1], SELECT[2], 0.55];
         const GHOST: [f32; 4] = [1.0, 1.0, 1.0, 0.28];
         let raw = self.world_mouse();
         let dragged = match self.editor.mode {
@@ -1077,14 +1377,19 @@ impl App {
             }
         }
 
-        // Hover hint when not already busy with a body
-        if matches!(self.editor.mode, EditorMode::Idle | EditorMode::Inspecting { .. } | EditorMode::FirstSelected { .. }) {
+        // Hover hint when not already busy with a body. Connecting (Shift
+        // held, or a first body picked) shows in red, with the attach point.
+        let connecting = self.editor.connect_ready || matches!(self.editor.mode, EditorMode::FirstSelected { .. });
+        if matches!(self.editor.mode, EditorMode::Idle | EditorMode::Inspecting { .. } | EditorMode::FirstSelected { .. } | EditorMode::Selection) {
             if let Some((i, _)) = self.pick_body(raw) {
                 let selected = match self.editor.mode {
-                    EditorMode::Inspecting { body_idx } | EditorMode::FirstSelected { body_idx, .. } => body_idx == i,
+                    EditorMode::Selection => self.editor.selection.contains(&i),
+                    EditorMode::Inspecting { body_idx } => body_idx == i && !connecting,
+                    EditorMode::FirstSelected { body_idx, .. } => body_idx == i,
                     _ => false,
                 };
-                if !selected { self.draw_brackets(i, HOVER); }
+                if !selected { self.draw_brackets(i, if connecting { SEL_B } else { HOVER }); }
+                if connecting { self.draw_reticle(cursor, SEL_B); }
             }
         }
 
@@ -1153,14 +1458,14 @@ impl App {
             }
             EditorMode::FirstSelected { body_idx, world_pos } => {
                 self.draw_brackets(body_idx, SEL);
-                self.draw_reticle(world_pos, SEL);
-                self.geo.draw_dashed(world_pos, cursor, 0.014, 0.08, 0.06, HOVER);
+                self.draw_dashed_haloed(world_pos, cursor, SEL_B);
+                self.draw_reticle(world_pos, SEL_B);
             }
             EditorMode::BothSelected { body_a, attach_a, body_b, attach_b } => {
                 self.draw_brackets(body_a, SEL);
                 self.draw_brackets(body_b, SEL_B);
-                self.geo.draw_dashed(attach_a, attach_b, 0.016, 0.08, 0.06, SEL);
-                self.draw_reticle(attach_a, SEL);
+                self.draw_dashed_haloed(attach_a, attach_b, SEL_B);
+                self.draw_reticle(attach_a, SEL_B);
                 self.draw_reticle(attach_b, SEL_B);
             }
             EditorMode::PulleyPending { body_a, attach_a, body_b, attach_b } => {
@@ -1194,7 +1499,27 @@ impl App {
                 }
                 self.draw_reticle(cursor, SEL_B);
             }
+            EditorMode::BoxSelecting { start } => {
+                let (lo, hi) = (start.min(raw), start.max(raw));
+                let (a, b, c, d) = (lo, Vec2::new(hi.x, lo.y), hi, Vec2::new(lo.x, hi.y));
+                self.geo.draw_quad(a, b, c, d, [SELECT[0], SELECT[1], SELECT[2], 0.08]);
+                let w = 1.5 * self.camera.scale;
+                let (dash, gap) = (6.0 * self.camera.scale, 4.0 * self.camera.scale);
+                for (p, q) in [(a, b), (b, c), (c, d), (d, a)] {
+                    self.geo.draw_dashed(p, q, w, dash, gap, SEL);
+                }
+                for i in self.bodies_in_box(start, raw) { self.draw_brackets(i, SEL); }
+            }
+            EditorMode::Selection | EditorMode::GroupDragging { .. } => {
+                for i in self.editor.selection.clone() { self.draw_brackets(i, SEL); }
+            }
             EditorMode::Idle => {}
+        }
+
+        // The body under the pointer in the Parts list, found wherever it is.
+        if let Some(i) = self.editor.list_hover {
+            self.draw_brackets(i, SEL_B);
+            if let Some(b) = self.world.bodies.get(i) { self.draw_reticle(b.pos32(), SEL_B); }
         }
 
         // Every trace point, so they can be found and grabbed.
@@ -1233,17 +1558,17 @@ impl App {
     /// Rotate handle: a guide arc on the handle's circle, a spoke from the
     /// centre, and a round knob (filled when hovered or dragged).
     fn draw_rotate_handle(&mut self, body_idx: usize, fill: Option<[f32; 4]>) {
-        use crate::scenes::{BG, WHITE};
+        use crate::scenes::BG;
         let Some(b) = self.world.bodies.get(body_idx) else { return };
         let Some(p) = crate::editor::rotate_handle(b) else { return };
         let c = b.pos32();
         let r = (p - c).length();
         let a = (p - c).y.atan2((p - c).x);
         let px = self.camera.scale;
-        self.geo.draw_arc(c, r, a - 0.5, a + 0.5, 24, 1.5 * px, [1.0, 1.0, 1.0, 0.5]);
-        self.geo.draw_dashed(c, p, 1.5 * px, 6.0 * px, 5.0 * px, [1.0, 1.0, 1.0, 0.5]);
+        self.geo.draw_arc(c, r, a - 0.5, a + 0.5, 24, 1.5 * px, SELECT_FAINT);
+        self.geo.draw_dashed(c, p, 1.5 * px, 6.0 * px, 5.0 * px, SELECT_FAINT);
         self.geo.draw_circle(p, 8.0 * px, 20, BG);
-        self.geo.draw_circle(p, 6.5 * px, 20, fill.unwrap_or(WHITE));
+        self.geo.draw_circle(p, 6.5 * px, 20, fill.unwrap_or(SELECT));
         if fill.is_none() {
             self.geo.draw_circle(p, 3.5 * px, 16, BG);
         }
@@ -1252,7 +1577,7 @@ impl App {
     /// Resize handles: diamonds pointing along the dimension they change,
     /// on a faint guide from the body; `active` is drawn filled in `fill`.
     fn draw_resize_handles(&mut self, body_idx: usize, active: Option<crate::editor::ResizeKind>, fill: [f32; 4]) {
-        use crate::scenes::{BG, WHITE};
+        use crate::scenes::BG;
         let Some(b) = self.world.bodies.get(body_idx) else { return };
         let c = b.pos32();
         let handles = crate::editor::resize_handles(b);
@@ -1260,24 +1585,24 @@ impl App {
         for (kind, p) in handles {
             let d = (p - c).normalize_or_zero();
             let n = d.perp();
-            self.geo.draw_dashed(c + (p - c) * 0.55, p, 1.5 * px, 4.0 * px, 4.0 * px, [1.0, 1.0, 1.0, 0.5]);
+            self.geo.draw_dashed(c + (p - c) * 0.55, p, 1.5 * px, 4.0 * px, 4.0 * px, SELECT_FAINT);
             // Diamond elongated along the direction it resizes in.
             let (along, across) = (d * 10.0 * px, n * 6.0 * px);
             let on = active == Some(kind);
             self.geo.draw_diamond(p, along * 1.3, across * 1.45, BG);
-            self.geo.draw_diamond(p, along, across, if on { fill } else { WHITE });
+            self.geo.draw_diamond(p, along, across, if on { fill } else { SELECT });
             if !on { self.geo.draw_diamond(p, along * 0.45, across * 0.45, BG); }
         }
     }
 
     fn draw_handle(&mut self, p: Vec2, fill: Option<[f32; 4]>) {
-        use crate::scenes::{BG, WHITE};
+        use crate::scenes::BG;
         let hs = 6.0 * self.camera.scale; // constant on-screen size
         let o = 2.0 * self.camera.scale;
         let x = Vec2::new(hs + o, 0.0);
         self.geo.draw_line(p - x, p + x, 2.0 * (hs + o), BG);
         let x = Vec2::new(hs, 0.0);
-        self.geo.draw_line(p - x, p + x, 2.0 * hs, fill.unwrap_or(WHITE));
+        self.geo.draw_line(p - x, p + x, 2.0 * hs, fill.unwrap_or(SELECT));
         if fill.is_none() {
             let x = Vec2::new(hs * 0.45, 0.0);
             self.geo.draw_line(p - x, p + x, 0.9 * hs, BG);
@@ -1294,13 +1619,22 @@ impl App {
         self.geo.draw_line(p - diag(a * 0.25), p + diag(a * 0.25), a * 0.5 * std::f32::consts::SQRT_2, BG);
     }
 
-    /// Ring with four outward ticks marking an exact attach point.
+    /// Ring with four outward ticks marking an exact attach point, over a
+    /// background-coloured halo so it shows on white parts too.
     fn draw_reticle(&mut self, p: Vec2, color: [f32; 4]) {
         let r = 0.07;
-        self.geo.draw_arc(p, r, 0.0, std::f32::consts::TAU, 24, 0.016, color);
-        for d in [Vec2::X, Vec2::Y, -Vec2::X, -Vec2::Y] {
-            self.geo.draw_line(p + d * (r + 0.02), p + d * (r + 0.08), 0.016, color);
+        for (w, c) in [(0.016 + 0.024, crate::scenes::BG), (0.016, color)] {
+            self.geo.draw_arc(p, r, 0.0, std::f32::consts::TAU, 24, w, c);
+            for d in [Vec2::X, Vec2::Y, -Vec2::X, -Vec2::Y] {
+                self.geo.draw_line(p + d * (r + 0.02), p + d * (r + 0.08), w, c);
+            }
+            self.geo.draw_circle(p, 0.015 + (w - 0.016) * 0.5, 8, c);
         }
-        self.geo.draw_circle(p, 0.015, 8, color);
+    }
+
+    /// Dashed line over a background-coloured halo, readable across parts.
+    fn draw_dashed_haloed(&mut self, a: Vec2, b: Vec2, color: [f32; 4]) {
+        self.geo.draw_dashed(a, b, 0.016 + 0.024, 0.08, 0.06, crate::scenes::BG);
+        self.geo.draw_dashed(a, b, 0.016, 0.08, 0.06, color);
     }
 }

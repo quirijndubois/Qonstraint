@@ -44,6 +44,9 @@ pub struct BodyEdit {
     pub mass:     f32,
     pub fixed:    bool,
     pub collide:  bool,
+    /// Contact material, shown only while `collide` is on.
+    pub friction:    f32,
+    pub restitution: f32,
     pub radius:   f32,   // Disk only
     pub half_len: f32,   // Rod only
     pub half_width: f32, // Rod only
@@ -222,7 +225,7 @@ impl BodyEdit {
             BodyShape::Point                          => (0.35, 0.5, 0.06),
         };
         let angle = wrapped_degrees(body);
-        Self { mass: body.mass, fixed: body.fixed, collide: body.collide, radius, half_len, half_width, angle, angle_synced: angle }
+        Self { mass: body.mass, fixed: body.fixed, collide: body.collide, friction: body.friction, restitution: body.restitution, radius, half_len, half_width, angle, angle_synced: angle }
     }
 
     /// Apply edited values back to body `idx`, recalculating inertia; a
@@ -240,6 +243,8 @@ impl BodyEdit {
         body.mass  = self.mass;
         body.fixed = self.fixed;
         body.collide = self.collide;
+        body.friction = self.friction;
+        body.restitution = self.restitution;
         if self.fixed {
             // A fixed body isn't integrated, but constraints still read its
             // velocity; a leftover spin would drive whatever rolls on it.
@@ -347,6 +352,21 @@ pub enum EditorMode {
         body_idx: usize,
         kind:     ResizeKind,
     },
+    /// Dragging a box over empty space from `start` (world); on release
+    /// the bodies whose centres lie inside become the selection.
+    BoxSelecting {
+        start: Vec2,
+    },
+    /// Several bodies selected (`Editor::selection`): drag one to move them
+    /// all, Delete, Ctrl+C / Ctrl+X.
+    Selection,
+    /// Moving the whole selection, grabbed by `body` at `start`; `last` is
+    /// the previous cursor point. Released without moving, it selects `body`.
+    GroupDragging {
+        last:  Vec2,
+        start: Vec2,
+        body:  usize,
+    },
     /// Dragging one of the selected body's connection points
     DraggingHandle {
         body_idx: usize,
@@ -410,6 +430,17 @@ pub struct Editor {
     pub torsion_d:           f32,
     /// What the connection row under the pointer links to, for scene highlighting.
     pub link_hover:          Option<LinkHover>,
+    /// Bodies of a multi-selection (`EditorMode::Selection`), ascending.
+    pub selection:           Vec<usize>,
+    /// Something has been copied (Ctrl+V would paste).
+    pub can_paste:           bool,
+    /// The Parts window's list of every body is open.
+    pub show_body_list:      bool,
+    /// Body under the pointer in that list, highlighted in the scene.
+    pub list_hover:          Option<usize>,
+    /// Shift is held where a click would pick a connection's first body
+    /// (set by the app each frame; shown in the scene and the status line).
+    pub connect_ready:       bool,
 }
 
 /// How the number of physics steps per frame is chosen.
@@ -455,6 +486,11 @@ impl Default for Editor {
             torsion_k:          20.0,
             torsion_d:          0.5,
             link_hover:         None,
+            connect_ready:      false,
+            selection:          Vec::new(),
+            can_paste:          false,
+            show_body_list:     false,
+            list_hover:         None,
         }
     }
 }
@@ -470,6 +506,26 @@ impl Editor {
         self.inspect_shape = None;
         self.pending_constraint = None;
         self.link_hover = None;
+        self.list_hover = None;
+        self.selection.clear();
+    }
+
+    /// The bodies an edit command (copy, cut, delete) acts on: the group,
+    /// or the one inspected body.
+    pub fn selected_bodies(&self) -> Vec<usize> {
+        match self.mode {
+            EditorMode::Selection | EditorMode::GroupDragging { .. } => self.selection.clone(),
+            EditorMode::Inspecting { body_idx } => vec![body_idx],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Delete several bodies (and everything attached to them).
+    pub fn delete_bodies(&self, bodies: &[usize], world: &mut World) {
+        let mut ids = bodies.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        for &i in ids.iter().rev() { self.delete_body(i, world); }
     }
 
     /// Place a new body at world position.
