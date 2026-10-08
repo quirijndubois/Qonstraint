@@ -29,6 +29,10 @@ pub struct Body {
     /// elastic). A pair uses √(μa·μb) and the larger restitution.
     pub friction: f32,
     pub restitution: f32,
+    /// Depth plane for contacts, as if parts sat side by side front to
+    /// back: two bodies collide when they share a plane or either is in
+    /// plane 0 (all planes: ground, walls).
+    pub plane: u8,
 }
 
 pub const DEFAULT_FRICTION: f32 = 0.5;
@@ -69,6 +73,7 @@ impl Body {
             collide: false,
             friction: DEFAULT_FRICTION,
             restitution: DEFAULT_RESTITUTION,
+            plane: 0,
         }
     }
 
@@ -117,6 +122,12 @@ impl Body {
     pub fn apply_force_at_world_point(&mut self, force: DVec2, world_point: DVec2) {
         self.force_accum += force;
         self.torque_accum += (world_point - self.pos).perp_dot(force);
+    }
+
+    /// Whether contacts between `self` and `other` are possible at all.
+    #[inline]
+    pub fn shares_plane(&self, other: &Body) -> bool {
+        self.plane == 0 || other.plane == 0 || self.plane == other.plane
     }
 
     #[inline]

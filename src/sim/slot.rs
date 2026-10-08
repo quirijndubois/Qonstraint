@@ -9,10 +9,15 @@ pub struct Slot<T: ?Sized> {
     /// Taking part in the simulation. Off, a constraint holds nothing and a
     /// force pushes nothing, but both stay in place (and saved) to turn back on.
     pub on: bool,
+    /// Constraints only: the joint breaks (switches off, `broken` set) once
+    /// the force it carries exceeds this.
+    pub break_force: Option<f32>,
+    /// Switched off by breaking rather than by hand; drawn as nothing.
+    pub broken: bool,
 }
 
 impl<T: ?Sized> Slot<T> {
-    pub fn new(item: Box<T>) -> Self { Self { item, on: true } }
+    pub fn new(item: Box<T>) -> Self { Self { item, on: true, break_force: None, broken: false } }
 }
 
 impl<T: ?Sized> Deref for Slot<T> {

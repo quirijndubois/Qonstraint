@@ -47,6 +47,11 @@ impl Reaction {
         (0..self.n).filter(|&k| self.body[k] == body)
             .map(|k| glam::DVec2::new(self.f[k].x, self.f[k].y)).sum()
     }
+
+    /// The largest force (torque left out) on any one body.
+    pub fn max_force(&self) -> f64 {
+        (0..self.n).map(|k| glam::DVec2::new(self.f[k].x, self.f[k].y).length()).fold(0.0, f64::max)
+    }
 }
 
 impl ConstraintEval {

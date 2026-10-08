@@ -92,6 +92,12 @@ impl GearJoint {
         ra * bodies[self.body_a].angle + self.kind.sign() * rb * bodies[self.body_b].angle
     }
 
+    /// The phase offset the joint holds (saved with the scene, so a reload
+    /// continues exactly instead of re-capturing it from the current pose).
+    pub fn phase(&self) -> f64 { self.k }
+
+    pub fn set_phase(&mut self, k: f64) { self.k = k; }
+
     /// Angular velocity ratio ω_b / ω_a with the axles held still.
     pub fn ratio(&self, bodies: &[Body]) -> f64 {
         let (ra, rb) = self.radii(bodies);

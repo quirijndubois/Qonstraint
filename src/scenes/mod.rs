@@ -5,31 +5,51 @@ use crate::sim::{
     constraints::{
         cylinder::{CylinderState, GasMode, Stroke}, slider::{COLLAR_HALF, STOP_W},
         Cylinder, DistanceConstraint, GearJoint, GearKind, PinJoint, PinWorld, Rope, SliderJoint,
+        WeldJoint,
     },
     forces::{spring::SpringDamper, Motor, TorsionSpring},
     world::World,
 };
 
 pub mod air_struts;
+pub mod bartons_pendulums;
 pub mod coupled_pendulums;
+pub mod domino_cascade;
 pub mod double_pendulum;
 pub mod elastic_pendulum;
 pub mod flexible_beam;
+pub mod galton_board;
 pub mod gear_train;
+pub mod geneva_drive;
+pub mod hot_rod;
 pub mod kapitza;
 pub mod peaucellier;
+pub mod pendulum_clock;
+pub mod pendulum_wave;
 pub mod planetary_pendulum;
+pub mod planetary_press;
+pub mod pumpjacks;
 pub mod radial_engine;
+pub mod rimless_wheel;
 pub mod rocker_linkage;
 pub mod rolling_crane;
+pub mod rube_goldberg;
 pub mod sandbox;
+pub mod soft_bodies;
+pub mod steam_locomotive;
 pub mod strandbeest;
 pub mod swinging_atwood;
+pub mod tank;
 pub mod trammel;
+pub mod trebuchet;
+pub mod truss_bridge;
 pub mod tumbler;
+pub mod walking_beest;
 pub mod watt_linkage;
 #[cfg(test)]
 mod bench;
+#[cfg(test)]
+mod probe;
 
 pub const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 /// Matches the grid shader background, so outlines and holes read as gaps.
@@ -166,6 +186,125 @@ pub static SCENES: &[SceneDef] = &[
         view_size:     [5.6, 3.8],
     },
     SceneDef {
+        name:          "Pendulum Wave",
+        description:   "Fifteen pendulums tuned to 15..29 swings in 30 s: waves, chaos, then in step again",
+        build:         pendulum_wave::build,
+        camera_center: [0.0, 0.6],
+        view_size:     [5.4, 3.0],
+    },
+    SceneDef {
+        name:          "Barton's Pendulums",
+        description:   "A heavy driver shakes the beam: only the pendulum of matching length swings up",
+        build:         bartons_pendulums::build,
+        camera_center: [-0.2, 0.6],
+        view_size:     [6.8, 3.6],
+    },
+    SceneDef {
+        name:          "Galton Board",
+        description:   "200 balls through 11 rows of pegs pile into a bell curve",
+        build:         galton_board::build,
+        camera_center: [0.0, 1.4],
+        view_size:     [3.4, 6.8],
+    },
+    SceneDef {
+        name:          "Soft Bodies",
+        description:   "Spring-skinned blobs drop on shelves into a tub with a kneading paddle",
+        build:         soft_bodies::build,
+        camera_center: [0.0, 1.3],
+        view_size:     [5.8, 6.2],
+    },
+    SceneDef {
+        name:          "Domino Cascade",
+        description:   "Each domino 1.32x the last: a light tap topples one 150 times heavier",
+        build:         domino_cascade::build,
+        camera_center: [0.2, 0.0],
+        view_size:     [7.8, 3.8],
+    },
+    SceneDef {
+        name:          "Pumpjacks",
+        description:   "Three oil pumpjacks: belt-driven cranks rock the beams, horseheads wind the bridles, counterweights balance the rods",
+        build:         pumpjacks::build,
+        camera_center: [0.2, 0.5],
+        view_size:     [15.0, 5.0],
+    },
+    SceneDef {
+        name:          "Planetary Press",
+        description:   "Sun, planets and ring gear drive a crank press; its sprung punch stamps blocks riding a conveyor",
+        build:         planetary_press::build,
+        camera_center: [0.6, -0.1],
+        view_size:     [8.6, 6.0],
+    },
+    SceneDef {
+        name:          "Geneva Drive",
+        description:   "A crank pin indexes a slotted wheel a quarter turn at a time; a belt-driven cam rocks a sprung lever",
+        build:         geneva_drive::build,
+        camera_center: [-0.1, -0.55],
+        view_size:     [5.6, 5.0],
+    },
+    SceneDef {
+        name:          "Pendulum Clock",
+        description:   "Weight-driven clock: the anchor escapement lets the wheel through one tooth per swing and kicks the pendulum",
+        build:         pendulum_clock::build,
+        camera_center: [0.4, -0.4],
+        view_size:     [3.6, 3.8],
+    },
+    SceneDef {
+        name:          "Rimless Wheel",
+        description:   "Ten spokes, no rim: rolls down a slope into a steady gait where each impact undoes what the slope gives",
+        build:         rimless_wheel::build,
+        camera_center: [0.0, 0.3],
+        view_size:     [6.0, 3.4],
+    },
+    SceneDef {
+        name:          "Truss Bridge",
+        description:   "A heavy cart drives onto a truss with breakable joints: it holds, then folds into the river",
+        build:         truss_bridge::build,
+        camera_center: [0.0, -0.8],
+        view_size:     [13.6, 6.2],
+    },
+    SceneDef {
+        name:          "Trebuchet",
+        description:   "A hinged counterweight whips a rope sling; it lets go at its breaking pull and the stone flies 20 m into a wall",
+        build:         trebuchet::build,
+        camera_center: [10.5, 7.6],
+        view_size:     [34.0, 16.4],
+    },
+    SceneDef {
+        name:          "Walking Strandbeest",
+        description:   "Four Jansen legs on a free frame, cranks half a turn apart: it walks on the friction of its feet",
+        build:         walking_beest::build,
+        camera_center: [0.0, 1.4],
+        view_size:     [6.6, 4.6],
+    },
+    SceneDef {
+        name:          "Steam Locomotive",
+        description:   "Coupled drivers, a cylinder and main rod, tender and two coaches: the train gets going on its own steam",
+        build:         steam_locomotive::build,
+        camera_center: [-3.4, 1.0],
+        view_size:     [16.0, 4.4],
+    },
+    SceneDef {
+        name:          "Hot Rod",
+        description:   "An exposed inline four (geared cranks, firing 1-3-4-2) belts the rear wheel over rolling ground",
+        build:         hot_rod::build,
+        camera_center: [0.0, 0.9],
+        view_size:     [8.0, 3.8],
+    },
+    SceneDef {
+        name:          "Tank",
+        description:   "A closed track of pinned links round sprocket, idler and road wheels: friction drive over a log and up a step",
+        build:         tank::build,
+        camera_center: [0.0, 0.8],
+        view_size:     [7.4, 3.6],
+    },
+    SceneDef {
+        name:          "Rube Goldberg",
+        description:   "Ball, ramps, dominoes, a breakable latch, a falling weight, rope, gate, gear and flag: one cause after another",
+        build:         rube_goldberg::build,
+        camera_center: [-0.6, 0.6],
+        view_size:     [15.0, 8.2],
+    },
+    SceneDef {
         name:          "Untitled",
         description:   "Empty  ·  drag parts in from the editor panel",
         build:         sandbox::build,
@@ -218,7 +357,9 @@ pub(crate) fn from_down(phi: f32) -> Vec2 {
 //
 // Every scene draws through `draw_world`, so each element looks the same
 // everywhere: flat white parts, a background-coloured outline that separates
-// overlapping parts, and pin bosses at every connection point.
+// overlapping parts, and pin bosses at every connection point. Fixed parts
+// stand on pedestals, except fixed parts that collide: those are scenery
+// (ground, walls, pegs) and need no mount.
 
 const OUTLINE:     f32 = 0.024;
 const PIN_BOSS_R:  f32 = 0.085;
@@ -245,6 +386,7 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
     let n = bodies.len();
     let fill = |i: usize| tint.get(i).copied().unwrap_or(WHITE);
     let gears = gear_phases(world);
+    let rings = ring_gears(world);
 
     let ceiling = |p: Vec2| anchor_ref_y.is_some_and(|y| p.y > y);
 
@@ -273,7 +415,8 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
             pins.push(pw.target);
         }
     }
-    for b in bodies.iter().filter(|b| b.fixed || matches!(b.shape, BodyShape::Point)) {
+    // Fixed bodies that collide are scenery (ground, walls, pegs): no mount.
+    for b in bodies.iter().filter(|b| (b.fixed && !b.collide) || matches!(b.shape, BodyShape::Point)) {
         draw_pedestal(geo, b.pos32(), ceiling(b.pos32()));
         if matches!(b.shape, BodyShape::Point) {
             draw_pin_hole(geo, b.pos32());
@@ -289,6 +432,11 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
     for (i, b) in bodies.iter().enumerate() {
         if let BodyShape::Disk { radius } = b.shape {
             let color = fill(i);
+            if rings.get(i).copied().unwrap_or(false) {
+                let phase = gears.get(i).copied().flatten().unwrap_or(0.0);
+                draw_ring_gear(geo, b.pos32(), radius, b.angle32() + phase, color);
+                continue;
+            }
             let body_r = match gears.get(i).copied().flatten() {
                 Some(phase) => {
                     draw_teeth(geo, b.pos32(), radius, b.angle32() + phase, color);
@@ -407,6 +555,11 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
             if pj.body_a < n && pj.body_b < n {
                 pins.push(bodies[pj.body_a].world_point(pj.local_a));
             }
+        } else if let Some(wj) = c.downcast_ref::<WeldJoint>() {
+            if wj.body_a < n && wj.body_b < n {
+                let a = &bodies[wj.body_a];
+                draw_weld(geo, a.world_point(wj.local_a), a.angle32());
+            }
         }
     }
 
@@ -427,7 +580,8 @@ pub fn draw_world(world: &World, anchor_ref_y: Option<f32>, tint: &[[f32; 4]], g
     }
 
     // 10. Switched-off connections: a faint dashed trace of what they link
-    let off_constraints = world.constraints.iter().filter(|c| !c.on).map(|c| {
+    // (A broken joint is gone: nothing to draw.)
+    let off_constraints = world.constraints.iter().filter(|c| !c.on && !c.broken).map(|c| {
         let any = c.as_any();
         let end = any.downcast_ref::<PinWorld>().map(|pw| pw.target);
         (c.body_indices(), end)
@@ -507,9 +661,16 @@ fn gear_phases(world: &World) -> Vec<Option<f32>> {
     let mut phase: Vec<Option<f32>> = vec![None; bodies.len()];
     for c in world.constraints.iter().filter(|c| c.on) {
         let Some(g) = c.as_any().downcast_ref::<GearJoint>() else { continue };
-        if g.kind != GearKind::Mesh || g.body_a >= bodies.len() || g.body_b >= bodies.len() { continue; }
+        if g.body_a >= bodies.len() || g.body_b >= bodies.len() { continue; }
         let (a, b) = (g.body_a, g.body_b);
         let (Some(ra), Some(rb)) = (disk_r(&bodies[a]), disk_r(&bodies[b])) else { continue };
+        if g.kind == GearKind::Belt {
+            if let Some((ring, _)) = internal_pair(&bodies[a], &bodies[b]) {
+                let (ring, pinion) = if ring == 0 { (a, b) } else { (b, a) };
+                internal_phase(bodies, &mut phase, ring, pinion);
+            }
+            continue;
+        }
         let (pa, pb) = (phase[a], phase[b]);
         // Orient the pair so `from` already has a phase if either does.
         let (from, to, rf, rt) = if pa.is_none() && pb.is_some() { (b, a, rb, ra) } else { (a, b, ra, rb) };
@@ -527,6 +688,75 @@ fn gear_phases(world: &World) -> Vec<Option<f32>> {
         let _ = rt;
     }
     phase
+}
+
+/// Which of two disks (0 = first) is an internal ring gear round the
+/// other, if one sits inside the other.
+fn internal_pair(a: &Body, b: &Body) -> Option<(usize, usize)> {
+    let (ra, rb) = (disk_r(a)?, disk_r(b)?);
+    let d = (b.pos32() - a.pos32()).length();
+    if d + rb <= ra + 1e-3 && ra > rb { Some((0, 1)) }
+    else if d + ra <= rb + 1e-3 && rb > ra { Some((1, 0)) }
+    else { None }
+}
+
+/// Disks that are the ring of an internal gear (a belt-kind gear joint
+/// with the other disk inside it).
+fn ring_gears(world: &World) -> Vec<bool> {
+    let b = &world.bodies;
+    let mut out = vec![false; b.len()];
+    for c in world.constraints.iter().filter(|c| c.on) {
+        let Some(g) = c.as_any().downcast_ref::<GearJoint>() else { continue };
+        if g.kind != GearKind::Belt || g.body_a >= b.len() || g.body_b >= b.len() { continue; }
+        match internal_pair(&b[g.body_a], &b[g.body_b]) {
+            Some((0, _)) => out[g.body_a] = true,
+            Some(_) => out[g.body_b] = true,
+            None => {}
+        }
+    }
+    out
+}
+
+/// Tooth phase across an internal mesh: whichever of ring and pinion has
+/// one gives the other's, so the pinion's teeth sit in the ring's gaps.
+/// Both turn the same way, so unlike an external pair nothing is mirrored.
+fn internal_phase(bodies: &[Body], phase: &mut [Option<f32>], ring: usize, pinion: usize) {
+    let tau = std::f32::consts::TAU;
+    let (Some(rr), Some(rp)) = (disk_r(&bodies[ring]), disk_r(&bodies[pinion])) else { return };
+    let (nr, np) = (tooth_count(rr) as f32, tooth_count(rp) as f32);
+    let d = bodies[pinion].pos32() - bodies[ring].pos32();
+    let psi = d.y.atan2(d.x);
+    let (ar, ap) = (bodies[ring].angle32(), bodies[pinion].angle32());
+    if let Some(pr) = phase[ring] {
+        if phase[pinion].is_none() {
+            let fr = ((psi - ar - pr) * nr / tau).rem_euclid(1.0);
+            phase[pinion] = Some(psi - ap + (0.5 - fr) * tau / np);
+        }
+        return;
+    }
+    let pp = *phase[pinion].get_or_insert(0.0);
+    let ff = ((psi - ap - pp) * np / tau).rem_euclid(1.0);
+    phase[ring] = Some(psi - ar + (0.5 - ff) * tau / nr);
+}
+
+/// Internal gear: a white ring with teeth pointing in to the pitch circle.
+fn draw_ring_gear(geo: &mut GeometryBuilder, c: Vec2, r: f32, start: f32, color: [f32; 4]) {
+    let rim = (r * 0.18).clamp(0.08, 0.2);
+    geo.draw_circle(c, r + TOOTH_DED + rim + OUTLINE, 96, BG);
+    geo.draw_circle(c, r + TOOTH_DED + rim, 96, color);
+    geo.draw_circle(c, r + TOOTH_DED, 96, BG);
+    let n = tooth_count(r);
+    let step = std::f32::consts::TAU / n as f32;
+    let (root, tip) = (r + TOOTH_DED + 0.01, r - TOOTH_ADD);
+    for k in 0..n {
+        let a = start + k as f32 * step;
+        let dir = Vec2::new(a.cos(), a.sin());
+        let side = dir.perp();
+        let (w_root, w_tip) = (step * r * 0.30, step * r * 0.18);
+        let p0 = c + dir * root;
+        let p1 = c + dir * tip;
+        geo.draw_quad(p0 - side * w_root, p0 + side * w_root, p1 + side * w_tip, p1 - side * w_tip, color);
+    }
 }
 
 fn disk_r(b: &Body) -> Option<f32> {
@@ -790,6 +1020,17 @@ fn rounded_rect(geo: &mut GeometryBuilder, c: Vec2, u: Vec2, hl: f32, hw: f32, r
     }
 }
 
+/// Weld: a square plate turned with the body, four bolt heads.
+fn draw_weld(geo: &mut GeometryBuilder, p: Vec2, angle: f32) {
+    let u = Vec2::new(angle.cos(), angle.sin());
+    const HALF: f32 = 0.075;
+    rounded_rect(geo, p, u, HALF + OUTLINE, HALF + OUTLINE, 0.02 + OUTLINE, BG);
+    rounded_rect(geo, p, u, HALF, HALF, 0.02, WHITE);
+    for (a, b) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+        geo.draw_circle(p + (u * a + u.perp() * b) * 0.04, 0.014, 10, BG);
+    }
+}
+
 /// Joint: white boss with a dark hole and a white pin core.
 fn draw_pin(geo: &mut GeometryBuilder, p: Vec2) {
     outlined_circle(geo, p, PIN_BOSS_R, 24);
@@ -877,6 +1118,7 @@ mod tests {
     #[test]
     fn scenes_are_stable() {
         let dt = 1.0 / 240.0;
+        let mut failures = Vec::new();
         for (def, integ) in SCENES.iter().flat_map(|d| [(d, Integrator::Xpbd), (d, Integrator::Rk4)]) {
             let mut w = (def.build)();
             w.integrator = integ;
@@ -886,10 +1128,13 @@ mod tests {
             let sub = if integ == Integrator::Xpbd { 4 } else { 1 };
             let e0 = energy(&w);
             let (mut max_err, mut max_out, mut max_ke) = (0.0f32, 0.0f32, 0.0f32);
-            let c = Vec2::from(def.camera_center);
             let half = Vec2::from(def.view_size) * 0.5;
+            // A scene whose camera follows a body is judged in that view.
+            let followed = |w: &World| w.follow.map_or(Vec2::ZERO, |i| w.bodies[i].pos32());
+            let f0 = followed(&w);
             for _ in 0..(20.0 / dt) as usize {
                 for _ in 0..sub { w.step(dt / sub as f32); }
+                let c = Vec2::from(def.camera_center) + followed(&w) - f0;
                 max_err = max_err.max(w.constraint_error());
                 max_ke = max_ke.max(w.kinetic_energy());
                 for b in w.bodies.iter().filter(|b| !b.fixed) {
@@ -902,10 +1147,15 @@ mod tests {
                 "{:<20} {:<5} max C err {:.1e}  max outside view {:+.2}  KE peak {:.1}  E {:.2} → {:.2}",
                 def.name, format!("{integ:?}"), max_err, max_out, max_ke, e0, e1,
             );
-            assert!(w.bodies.iter().all(|b| b.pos32().is_finite() && b.vel.is_finite()), "{} blew up", def.name);
-            assert!(max_err < 0.02, "{}: constraint error {max_err}", def.name);
-            assert!(max_out < 0.3, "{}: left its view by {max_out}", def.name);
+            if !w.bodies.iter().all(|b| b.pos32().is_finite() && b.vel.is_finite()) {
+                failures.push(format!("{} ({integ:?}) blew up", def.name));
+            } else if max_err >= 0.02 {
+                failures.push(format!("{} ({integ:?}): constraint error {max_err}", def.name));
+            } else if max_out >= 0.3 {
+                failures.push(format!("{} ({integ:?}): left its view by {max_out}", def.name));
+            }
         }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
 
@@ -927,6 +1177,8 @@ fn force_sites(world: &World) -> Vec<(usize, usize, Vec2)> {
     for (ci, c) in world.constraints.iter().enumerate() {
         let any = c.as_any();
         if let Some(p) = any.downcast_ref::<PinJoint>() {
+            if p.body_b < n { out.push((ci, p.body_b, b[p.body_b].world_point(p.local_b))); }
+        } else if let Some(p) = any.downcast_ref::<WeldJoint>() {
             if p.body_b < n { out.push((ci, p.body_b, b[p.body_b].world_point(p.local_b))); }
         } else if let Some(p) = any.downcast_ref::<PinWorld>() {
             out.push((ci, p.body, p.target));

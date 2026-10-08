@@ -15,7 +15,7 @@ use crate::sim::{
     constraint::Constraint,
     constraints::{
         cylinder::GasMode, Cylinder, DistanceConstraint, GearJoint, GearKind, PinJoint, PinWorld,
-        RollingContact, RollingOnRod, Rope, SliderJoint,
+        RollingContact, RollingOnRod, Rope, SliderJoint, WeldJoint,
     },
     forces::{Gravity, Motor, SpringDamper, TorsionSpring},
     world::{Tracer, World},
@@ -35,6 +35,12 @@ pub struct SceneFile {
     /// Indices into `items` of connections switched off (`Slot::on`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub switched_off: Vec<usize>,
+    /// Breakable connections: (index into `items`, break force, broken).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breaks: Vec<(usize, f32, bool)>,
+    /// Body the camera follows while simulating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow: Option<usize>,
     /// World-wide contact material from before it was per body; only
     /// read, as the fallback for bodies that don't carry their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,7 +79,11 @@ pub struct BodyRec {
     pub friction: Option<f32>,
     #[serde(default)]
     pub restitution: Option<f32>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub plane: u8,
 }
+
+fn is_zero(v: &u8) -> bool { *v == 0 }
 
 #[derive(Serialize, Deserialize)]
 pub struct TracerRec { pub body: usize, pub local: [f32; 2], pub seconds: f32 }
@@ -81,6 +91,7 @@ pub struct TracerRec { pub body: usize, pub local: [f32; 2], pub seconds: f32 }
 #[derive(Serialize, Deserialize)]
 pub enum Item {
     Pin { a: usize, la: [f32; 2], b: usize, lb: [f32; 2] },
+    Weld { a: usize, la: [f32; 2], b: usize, lb: [f32; 2], angle: f64 },
     PinWorld { body: usize, local: [f32; 2], target: [f32; 2] },
     Distance { a: usize, la: [f32; 2], b: usize, lb: [f32; 2], len: f32 },
     Rolling { a: usize, b: usize },
@@ -100,13 +111,19 @@ pub enum Item {
         a: usize, b: usize, belt: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         collide: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<f64>,
     },
     Rope {
         a: usize, la: [f32; 2], b: usize, lb: [f32; 2],
         pulley: Option<usize>, wrap: f64, length: f32, grip: bool,
     },
     Gravity { g: f32 },
-    Motor { body: usize, torque: f32, drag: f32 },
+    Motor {
+        body: usize, torque: f32, drag: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stator: Option<usize>,
+    },
     Spring { a: usize, la: [f32; 2], b: usize, lb: [f32; 2], rest: f32, k: f32, c: f32 },
     Torsion { a: usize, b: usize, la: [f32; 2], rest: f32, k: f32, c: f32 },
 }
@@ -124,15 +141,18 @@ impl SceneFile {
             },
             pos: d2(b.pos), angle: b.angle, vel: d2(b.vel), ang_vel: b.ang_vel,
             mass: b.mass, inertia: b.inertia, fixed: b.fixed, collide: b.collide,
-            friction: Some(b.friction), restitution: Some(b.restitution),
+            friction: Some(b.friction), restitution: Some(b.restitution), plane: b.plane,
         }).collect();
 
         let mut items = Vec::new();
         let mut switched_off = Vec::new();
+        let mut breaks = Vec::new();
         for c in &w.constraints {
             let any = c.as_any();
             let item = if let Some(p) = any.downcast_ref::<PinJoint>() {
                 Item::Pin { a: p.body_a, la: v2(p.local_a), b: p.body_b, lb: v2(p.local_b) }
+            } else if let Some(p) = any.downcast_ref::<WeldJoint>() {
+                Item::Weld { a: p.body_a, la: v2(p.local_a), b: p.body_b, lb: v2(p.local_b), angle: p.angle }
             } else if let Some(p) = any.downcast_ref::<PinWorld>() {
                 Item::PinWorld { body: p.body, local: v2(p.local), target: v2(p.target) }
             } else if let Some(d) = any.downcast_ref::<DistanceConstraint>() {
@@ -152,7 +172,7 @@ impl SceneFile {
                     mode, throttle: cy.throttle, state,
                 }
             } else if let Some(g) = any.downcast_ref::<GearJoint>() {
-                Item::Gear { a: g.body_a, b: g.body_b, belt: g.kind == GearKind::Belt, collide: g.collide }
+                Item::Gear { a: g.body_a, b: g.body_b, belt: g.kind == GearKind::Belt, collide: g.collide, phase: Some(g.phase()) }
             } else if let Some(r) = any.downcast_ref::<Rope>() {
                 Item::Rope {
                     a: r.body_a, la: v2(r.local_a), b: r.body_b, lb: v2(r.local_b),
@@ -161,6 +181,7 @@ impl SceneFile {
             } else {
                 continue;
             };
+            if let Some(f) = c.break_force { breaks.push((items.len(), f, c.broken)); }
             if !c.on { switched_off.push(items.len()); }
             items.push(item);
         }
@@ -169,7 +190,7 @@ impl SceneFile {
             let item = if let Some(g) = any.downcast_ref::<Gravity>() {
                 Item::Gravity { g: g.g }
             } else if let Some(m) = any.downcast_ref::<Motor>() {
-                Item::Motor { body: m.body, torque: m.torque, drag: m.drag }
+                Item::Motor { body: m.body, torque: m.torque, drag: m.drag, stator: m.stator }
             } else if let Some(s) = any.downcast_ref::<SpringDamper>() {
                 Item::Spring {
                     a: s.body_a, la: v2(s.local_a), b: s.body_b, lb: v2(s.local_b),
@@ -188,8 +209,8 @@ impl SceneFile {
             .map(|t| TracerRec { body: t.body, local: v2(t.local), seconds: t.seconds })
             .collect();
         Self {
-            v: VERSION, bodies, items, tracers, switched_off,
-            friction: None, restitution: None, view: None,
+            v: VERSION, bodies, items, tracers, switched_off, breaks,
+            follow: w.follow, friction: None, restitution: None, view: None,
         }
     }
 
@@ -212,6 +233,7 @@ impl SceneFile {
             b.collide = r.collide;
             b.friction = r.friction.or(self.friction).unwrap_or(DEFAULT_FRICTION);
             b.restitution = r.restitution.or(self.restitution).unwrap_or(DEFAULT_RESTITUTION);
+            b.plane = r.plane;
             w.add_body(b);
         }
         let n = w.bodies.len();
@@ -224,7 +246,15 @@ impl SceneFile {
                 if w.constraints.len() > before.0 { w.constraints.last_mut().unwrap().on = false; }
                 if w.forces.len() > before.1 { w.forces.last_mut().unwrap().on = false; }
             }
+            if let Some(&(_, f, broken)) = self.breaks.iter().find(|b| b.0 == idx)
+                && w.constraints.len() > before.0
+                && let Some(c) = w.constraints.last_mut()
+            {
+                c.break_force = Some(f);
+                c.broken = broken && !c.on;
+            }
         }
+        w.follow = self.follow.filter(|&i| i < n);
         for t in &self.tracers {
             if t.body < n {
                 w.tracers.push(Tracer { body: t.body, local: l(t.local), seconds: t.seconds });
@@ -240,6 +270,9 @@ impl SceneFile {
         let l = |a: [f32; 2]| Vec2::from(a);
         match *item {
             Item::Pin { a, la, b, lb } if ok(&[a, b]) => w.add_constraint(PinJoint::new(a, l(la), b, l(lb))),
+            Item::Weld { a, la, b, lb, angle } if ok(&[a, b]) => {
+                w.add_constraint(WeldJoint { body_a: a, local_a: l(la), body_b: b, local_b: l(lb), angle });
+            }
             Item::PinWorld { body, local, target } if ok(&[body]) => w.add_constraint(PinWorld::new(body, l(local), l(target))),
             Item::Distance { a, la, b, lb, len } if ok(&[a, b]) => w.add_constraint(DistanceConstraint::new(a, l(la), b, l(lb), len)),
             Item::Rolling { a, b } if ok(&[a, b]) => {
@@ -267,10 +300,11 @@ impl SceneFile {
                     w.add_constraint(cy);
                 }
             }
-            Item::Gear { a, b, belt, collide } if ok(&[a, b]) => {
+            Item::Gear { a, b, belt, collide, phase } if ok(&[a, b]) => {
                 let kind = if belt { GearKind::Belt } else { GearKind::Mesh };
                 if let Some(mut g) = GearJoint::new(a, b, kind, &w.bodies) {
                     g.collide = collide && belt;
+                    if let Some(k) = phase { g.set_phase(k); }
                     w.add_constraint(g);
                 }
             }
@@ -284,7 +318,11 @@ impl SceneFile {
                 w.add_constraint(r);
             }
             Item::Gravity { g } => w.add_force(Gravity::new(g)),
-            Item::Motor { body, torque, drag } if ok(&[body]) => w.add_force(Motor::new(body, torque, drag)),
+            Item::Motor { body, torque, drag, stator } if ok(&[body]) && stator.is_none_or(|s| s < n) => {
+                let mut m = Motor::new(body, torque, drag);
+                m.stator = stator;
+                w.add_force(m);
+            }
             Item::Spring { a, la, b, lb, rest, k, c } if ok(&[a, b]) => {
                 w.add_force(SpringDamper::new(a, l(la), b, l(lb), rest, k, c));
             }
@@ -336,6 +374,7 @@ pub fn extract(w: &World, keep: &[usize]) -> Option<SceneFile> {
     }
     let mut file = SceneFile::from_world(&sub);
     file.view = None;
+    file.follow = None;
     Some(file)
 }
 

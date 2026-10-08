@@ -23,6 +23,14 @@ const KD: f64 = 15.0;  // velocity feedback (Baumgarte)
 /// that is redundant with earlier ones (e.g. an over-constrained loop). Its
 /// multiplier is pinned to 0; the rows it duplicates carry the load.
 const PIVOT_TOL: f64 = 1e-9;
+/// A pivot that has lost almost all, but not quite all, of its diagonal
+/// marks rows that are nearly dependent: a parallelogram linkage passing
+/// its change point while a redundant twin holds it, say. Solved exactly,
+/// such a row turns the small, inconsistent drift feedback of its
+/// partners into huge, opposing multipliers. Holding the pivot at this
+/// fraction of its diagonal bounds them; well-conditioned rows are
+/// untouched.
+const PIVOT_FLOOR: f64 = 1e-5;
 
 #[derive(Default)]
 pub struct WitkinSolver {
@@ -260,6 +268,7 @@ impl WitkinSolver {
                 s -= l * l * self.d[k];
             }
             if diag > 0.0 && s > PIVOT_TOL * diag {
+                let s = s.max(PIVOT_FLOOR * diag);
                 self.d[i] = s;
                 self.d_inv[i] = 1.0 / s;
             } else {

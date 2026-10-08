@@ -15,7 +15,7 @@ use crate::sim::{
     constraint::Constraint,
     constraints::{
         cylinder::{GasMode, Stroke as GasStroke}, Cylinder, DistanceConstraint, GearJoint, GearKind,
-        PinJoint, PinWorld, RollingContact, RollingOnRod, Rope, SliderJoint,
+        PinJoint, PinWorld, RollingContact, RollingOnRod, Rope, SliderJoint, WeldJoint,
     },
     forces::{spring::SpringDamper, Motor, TorsionSpring},
     world::{Integrator, World},
@@ -626,6 +626,7 @@ fn selection_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut 
     if let EditorMode::BothSelected { .. } = editor.mode {
         for (lbl, kind) in [
             ("PIN JOINT",    ConstraintKind::PinJoint),
+            ("WELD",         ConstraintKind::Weld),
             ("DISTANCE ROD", ConstraintKind::Distance),
             ("ROLLING",      ConstraintKind::RollingContact),
             ("GEAR",         ConstraintKind::Gear),
@@ -691,9 +692,15 @@ fn selection_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut 
                 toggle_row(ui, "FIXED", &mut edit.fixed);
                 if shape != "Point" { toggle_row(ui, "COLLIDE", &mut edit.collide); }
             });
+            if shape != "Point" {
+                let mut follow = world.follow == Some(body_idx);
+                toggle_row(ui, "CAMERA FOLLOWS", &mut follow);
+                if follow { world.follow = Some(body_idx); } else if world.follow == Some(body_idx) { world.follow = None; }
+            }
             if edit.collide && shape != "Point" {
                 slider_row(ui, "FRICTION", &mut edit.friction, 0.0, 1.5);
                 slider_row(ui, "BOUNCE", &mut edit.restitution, 0.0, 1.0);
+                labelled(ui, "PLANE", |ui| segmented(ui, &mut edit.plane, &[(0, "ALL"), (1, "1"), (2, "2"), (3, "3"), (4, "4")]));
             }
             // One-click world pins on the natural spots.
             if let Some(body) = world.bodies.get(body_idx) {
@@ -1231,6 +1238,9 @@ fn draw_chaos_panel(ctx: &egui::Context, a: &mut Analysis, out: &mut HudOutput) 
 
 // ── Connections inspector ─────────────────────────────────────────────────────
 
+/// Load a connection breaks at when first made breakable (N).
+const DEFAULT_BREAK_FORCE: f32 = 100.0;
+
 /// Lists every constraint and spring touching `body_idx` as an editable card.
 /// Returns the far end of the card under the pointer, for scene highlighting.
 fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Option<LinkHover> {
@@ -1247,10 +1257,15 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
         if !c.body_indices().contains(&body_idx) { continue; }
         count += 1;
         let mut on = c.on;
+        let mut break_force = c.break_force;
+        let broken = c.broken;
         let any = c.as_any_mut();
         let (title, far) = if let Some(pj) = any.downcast_ref::<PinJoint>() {
             let o = other(pj.body_a, pj.body_b);
             (format!("Pin joint > {}", body_name(bodies, o)), LinkHover::Body(o))
+        } else if let Some(wj) = any.downcast_ref::<WeldJoint>() {
+            let o = other(wj.body_a, wj.body_b);
+            (format!("Weld > {}", body_name(bodies, o)), LinkHover::Body(o))
         } else if let Some(pw) = any.downcast_ref::<PinWorld>() {
             (format!("World pin @ {:.1}, {:.1}", pw.target.x, pw.target.y), LinkHover::Point(pw.target))
         } else if let Some(dc) = any.downcast_ref::<DistanceConstraint>() {
@@ -1285,8 +1300,11 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
             ("Constraint".to_owned(), LinkHover::Body(body_idx))
         };
 
+        let title = if broken { format!("{title} // broken") } else { title };
         let (delete, hovered) = link_card(ui, &title, Some(&mut on), |ui| {
-            if let Some(dc) = any.downcast_mut::<DistanceConstraint>() {
+            if any.is::<WeldJoint>() {
+                ui.label(text("Locks position and angle // one rigid part", SMALL_SIZE, MUTED));
+            } else if let Some(dc) = any.downcast_mut::<DistanceConstraint>() {
                 slider_row(ui, "LENGTH", &mut dc.rest_len, 0.05, 8.0);
             } else if let Some(cy) = any.downcast_mut::<Cylinder>() {
                 ui.horizontal(|ui| {
@@ -1333,25 +1351,45 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
                 ui.label(text("Pulls, never pushes", SMALL_SIZE, MUTED));
             } else if any.is::<RollingContact>() || any.is::<RollingOnRod>() {
                 ui.label(text("No slip // rotation locked to travel", SMALL_SIZE, MUTED));
-            } else {
+            } else if !any.is::<PinJoint>() && !any.is::<PinWorld>() {
                 ui.label(text("No parameters", SMALL_SIZE, MUTED));
             }
+            let mut breakable = break_force.is_some();
+            toggle_row(ui, "BREAKABLE", &mut breakable);
+            match (breakable, &mut break_force) {
+                (true, Some(f)) => log_slider_row(ui, "BREAK AT", f, 1.0, 5000.0),
+                (true, f) => *f = Some(DEFAULT_BREAK_FORCE),
+                (false, f) => *f = None,
+            }
         });
+        if on && !c.on { c.broken = false; }
         c.on = on;
+        c.break_force = break_force;
         if delete { remove_constraint = Some(ci); }
         if hovered { hover = Some(far); }
     }
 
     let mut has_motor = false;
+    let mount = crate::editor::axle_mount(world, body_idx);
+    let bodies = &world.bodies;
     for (fi, f) in world.forces.iter_mut().enumerate() {
         if !f.body_indices().contains(&body_idx) { continue; }
         let mut on = f.on;
         if let Some(mo) = f.as_any_mut().downcast_mut::<Motor>() {
+            // Listed on the driven body, not on the one it's mounted on.
+            if mo.body != body_idx { continue; }
             count += 1;
             has_motor = true;
             let (delete, _) = link_card(ui, "Motor", Some(&mut on), |ui| {
                 slider_row(ui, "TORQUE", &mut mo.torque, -50.0, 50.0);
                 slider_row(ui, "DRAG",   &mut mo.drag,   0.0, 10.0);
+                if let Some(mount) = mount {
+                    let mut mounted = mo.stator.is_some();
+                    toggle_row(ui, "MOUNTED", &mut mounted);
+                    mo.stator = mounted.then_some(mount);
+                    let on_what = if mounted { body_name(bodies, mount) } else { "world".to_owned() };
+                    ui.label(text(format!("Pushes back on {on_what}"), SMALL_SIZE, MUTED));
+                }
                 ui.label(text("Drive torque minus drag x spin", SMALL_SIZE, MUTED));
             });
             f.on = on;
@@ -1394,7 +1432,9 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
         ui.label(text("None", SMALL_SIZE, MUTED));
     }
     if !has_motor && hud_btn(ui, "+ MOTOR", false, ui.available_width()).clicked() {
-        world.add_force(Motor::new(body_idx, 0.0, 0.0));
+        let mut m = Motor::new(body_idx, 0.0, 0.0);
+        m.stator = mount;
+        world.add_force(m);
     }
     if let Some(ci) = remove_constraint { world.constraints.remove(ci); }
     if let Some(fi) = remove_force { world.forces.remove(fi); }

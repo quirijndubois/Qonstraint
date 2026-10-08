@@ -35,6 +35,8 @@ pub struct World {
     pub constraints: Vec<Slot<dyn Constraint>>,
     pub forces: Vec<Slot<dyn Force>>,
     pub tracers: Vec<Tracer>,
+    /// Body the camera keeps in view while simulating (a vehicle).
+    pub follow: Option<usize>,
     pub integrator: Integrator,
     /// Collisions between bodies with `collide` set, and their material.
     pub contacts: Contacts,
@@ -57,6 +59,7 @@ impl World {
             constraints: Vec::new(),
             forces: Vec::new(),
             tracers: Vec::new(),
+            follow: None,
             integrator: Integrator::default(),
             contacts: Contacts::default(),
             record_reactions: false,
@@ -78,6 +81,11 @@ impl World {
         self.constraints.push(Slot::new(Box::new(c)));
     }
 
+    /// Make the last added constraint breakable at `force`.
+    pub fn break_last_at(&mut self, force: f32) {
+        if let Some(c) = self.constraints.last_mut() { c.break_force = Some(force); }
+    }
+
     pub fn add_force(&mut self, f: impl Force + 'static) {
         self.forces.push(Slot::new(Box::new(f)));
     }
@@ -96,19 +104,36 @@ impl World {
 
     pub fn step(&mut self, dt: f32) {
         let dt = dt as f64;
-        self.contacts.prepare(&self.bodies, &self.constraints);
+        self.contacts.prepare(&self.bodies, &self.constraints, dt);
+        // Breakable joints need their load every step, overlay or not.
+        let breakable = self.constraints.iter().any(|c| c.on && c.break_force.is_some());
+        let record = self.record_reactions || breakable;
         match self.integrator {
             Integrator::Xpbd => {
                 if std::mem::take(&mut self.needs_settle) {
                     xpbd::settle(&mut self.bodies, &self.constraints, &mut self.xpbd);
                 }
-                let rec = self.record_reactions.then_some(&mut self.reactions);
+                let rec = record.then_some(&mut self.reactions);
                 xpbd::step(&mut self.bodies, &self.constraints, &self.forces, &mut self.contacts, dt, &mut self.xpbd, rec);
             }
-            Integrator::Rk4 => self.rk4_step(dt),
+            Integrator::Rk4 => self.rk4_step(dt, record),
         }
         for c in self.constraints.iter_mut().filter(|c| c.on) { c.post_step(&self.bodies); }
+        if breakable { self.break_overloaded(); }
         self.contacts.post_step(&self.bodies, dt);
+    }
+
+    /// Switch off every breakable joint whose load (the largest force it
+    /// put on any of its bodies this step) went over its limit.
+    fn break_overloaded(&mut self) {
+        if self.reactions.len() != self.constraints.len() { return; }
+        for (c, r) in self.constraints.iter_mut().zip(&self.reactions) {
+            let Some(max) = c.break_force else { continue };
+            if c.on && r.max_force() > max as f64 {
+                c.on = false;
+                c.broken = true;
+            }
+        }
     }
 
     /// Dynamic state of every body (and any evolving constraint state), for
@@ -119,6 +144,10 @@ impl World {
             out.extend([b.pos.x, b.pos.y, b.angle, b.vel.x, b.vel.y, b.ang_vel]);
         }
         for c in &self.constraints { c.save_state(out); }
+        // Whether each breakable joint still holds.
+        for c in self.constraints.iter().filter(|c| c.break_force.is_some()) {
+            out.push(if c.on { 1.0 } else { 0.0 });
+        }
     }
 
     /// Put back a state from `save_state`. Contact stick state is dropped.
@@ -131,6 +160,12 @@ impl World {
             b.ang_vel = v[5];
         }
         for c in self.constraints.iter_mut() { c.load_state(&mut rest); }
+        for c in self.constraints.iter_mut().filter(|c| c.break_force.is_some()) {
+            let Some((&v, tail)) = rest.split_first() else { break };
+            rest = tail;
+            c.on = v != 0.0;
+            c.broken = !c.on;
+        }
         self.contacts.reset();
     }
 
@@ -165,7 +200,7 @@ impl World {
     /// Classic RK4. Each stage's state is written straight into the bodies
     /// and its derivative folded into a running weighted sum, so the only
     /// storage is the start state and that sum.
-    fn rk4_step(&mut self, dt: f64) {
+    fn rk4_step(&mut self, dt: f64, record: bool) {
         const STAGE_DT: [f64; 3] = [0.5, 0.5, 1.0];
         const WEIGHT:   [f64; 4] = [1.0, 2.0, 2.0, 1.0];
 
@@ -181,7 +216,7 @@ impl World {
             for c in self.constraints.iter().filter(|c| c.on) { c.apply_forces(&mut self.bodies, dt); }
             self.contacts.apply(&mut self.bodies, dt);
             self.solver.apply(&mut self.bodies, &self.constraints);
-            if stage == 0 && self.record_reactions {
+            if stage == 0 && record {
                 self.solver.reactions(&self.constraints, &mut self.reactions);
             }
 
@@ -228,4 +263,37 @@ struct State {
 struct Rk4Scratch {
     s0: Vec<State>,
     sum: Vec<State>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::body::{disk_inertia, BodyShape};
+    use crate::sim::constraints::PinWorld;
+    use crate::sim::forces::Gravity;
+
+    /// A hanging weight on a breakable pin: it holds while the limit is
+    /// above the weight, snaps (and falls) once below, and a rewind to
+    /// before the break puts the pin back.
+    #[test]
+    fn breakable_pin_snaps_under_load() {
+        for integ in [Integrator::Rk4, Integrator::Xpbd] {
+            for (limit, holds) in [(12.0f32, true), (8.0, false)] {
+                let mut w = World::new();
+                w.integrator = integ;
+                let d = w.add_body(Body::new(Vec2::ZERO, 0.0, 1.0, disk_inertia(1.0, 0.2), BodyShape::Disk { radius: 0.2 }));
+                w.add_constraint(PinWorld::new(d, Vec2::ZERO, Vec2::ZERO));
+                w.break_last_at(limit);
+                w.add_force(Gravity::new(9.81));
+                let mut before = Vec::new();
+                w.save_state(&mut before);
+                for _ in 0..500 { w.step(0.002); }
+                assert_eq!(w.constraints[0].on, holds, "{integ:?} limit {limit}");
+                assert_eq!(w.constraints[0].broken, !holds);
+                assert_eq!(w.bodies[d].pos.y < -0.5, !holds, "falls once broken");
+                w.load_state(&before);
+                assert!(w.constraints[0].on && !w.constraints[0].broken, "rewind restores the pin");
+            }
+        }
+    }
 }

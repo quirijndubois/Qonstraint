@@ -7,6 +7,7 @@ pub mod rolling_contact;
 pub mod rolling_on_rod;
 pub mod rope;
 pub mod slider;
+pub mod weld;
 
 pub use cylinder::Cylinder;
 pub use distance::DistanceConstraint;
@@ -17,3 +18,4 @@ pub use rolling_contact::RollingContact;
 pub use rolling_on_rod::RollingOnRod;
 pub use rope::Rope;
 pub use slider::SliderJoint;
+pub use weld::WeldJoint;

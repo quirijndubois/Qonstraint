@@ -4,7 +4,7 @@ use crate::sim::{
     body::{Body, BodyShape, disk_inertia, rod_inertia},
     constraint::Constraint,
     constraints::{
-        Cylinder, DistanceConstraint, GearJoint, GearKind, PinJoint, PinWorld, RollingContact,
+        Cylinder, DistanceConstraint, GearJoint, GearKind, PinJoint, PinWorld, RollingContact, WeldJoint,
         RollingOnRod, Rope, SliderJoint,
     },
     forces::{spring::SpringDamper, TorsionSpring},
@@ -47,6 +47,7 @@ pub struct BodyEdit {
     /// Contact material, shown only while `collide` is on.
     pub friction:    f32,
     pub restitution: f32,
+    pub plane: u8,
     pub radius:   f32,   // Disk only
     pub half_len: f32,   // Rod only
     pub half_width: f32, // Rod only
@@ -175,6 +176,9 @@ fn scale_attachments(world: &mut World, idx: usize, s: Vec2) {
         if let Some(pj) = any.downcast_mut::<PinJoint>() {
             scale(pj.body_a, &mut pj.local_a);
             scale(pj.body_b, &mut pj.local_b);
+        } else if let Some(wj) = any.downcast_mut::<WeldJoint>() {
+            scale(wj.body_a, &mut wj.local_a);
+            scale(wj.body_b, &mut wj.local_b);
         } else if let Some(pw) = any.downcast_mut::<PinWorld>() {
             scale(pw.body, &mut pw.local);
         } else if let Some(dc) = any.downcast_mut::<DistanceConstraint>() {
@@ -225,7 +229,7 @@ impl BodyEdit {
             BodyShape::Point                          => (0.35, 0.5, 0.06),
         };
         let angle = wrapped_degrees(body);
-        Self { mass: body.mass, fixed: body.fixed, collide: body.collide, friction: body.friction, restitution: body.restitution, radius, half_len, half_width, angle, angle_synced: angle }
+        Self { mass: body.mass, fixed: body.fixed, collide: body.collide, friction: body.friction, restitution: body.restitution, plane: body.plane, radius, half_len, half_width, angle, angle_synced: angle }
     }
 
     /// Apply edited values back to body `idx`, recalculating inertia; a
@@ -245,6 +249,7 @@ impl BodyEdit {
         body.collide = self.collide;
         body.friction = self.friction;
         body.restitution = self.restitution;
+        body.plane = self.plane;
         if self.fixed {
             // A fixed body isn't integrated, but constraints still read its
             // velocity; a leftover spin would drive whatever rolls on it.
@@ -283,6 +288,7 @@ pub fn sync_world_pins(world: &mut World, idx: usize) {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConstraintKind {
     PinJoint,
+    Weld,
     PinToWorld,
     RollingContact,
     Distance,
@@ -575,6 +581,11 @@ impl Editor {
                     world.add_constraint(PinJoint::new(body_a, local_a, b, local_b));
                 }
             }
+            ConstraintKind::Weld => {
+                if let Some(b) = body_b {
+                    world.add_constraint(WeldJoint::new(body_a, b, attach_a, &world.bodies));
+                }
+            }
             ConstraintKind::PinToWorld => {
                 let local_a = world_to_local(&world.bodies[body_a], attach_a);
                 world.add_constraint(PinWorld::new(body_a, local_a, attach_b));
@@ -652,6 +663,11 @@ impl Editor {
             }
         }
 
+        world.follow = match world.follow {
+            Some(f) if f == idx => None,
+            Some(f) if f > idx => Some(f - 1),
+            f => f,
+        };
         world.tracers.retain(|t| t.body != idx);
         for t in &mut world.tracers {
             if t.body > idx { t.body -= 1; }
@@ -680,6 +696,17 @@ pub fn add_rope_over(a: usize, attach_a: Vec2, b: usize, attach_b: Vec2, pulley:
         Some(r) => { world.add_constraint(r); true }
         None => false,
     }
+}
+
+/// The body that `idx`'s axle is pinned to (a pin joint at its centre),
+/// where a motor driving it would be mounted.
+pub fn axle_mount(world: &World, idx: usize) -> Option<usize> {
+    world.constraints.iter().filter(|c| c.on).find_map(|c| {
+        let pj = c.as_any().downcast_ref::<PinJoint>()?;
+        if pj.body_a == idx && pj.local_a.length() < 1e-3 { Some(pj.body_b) }
+        else if pj.body_b == idx && pj.local_b.length() < 1e-3 { Some(pj.body_a) }
+        else { None }
+    })
 }
 
 /// Points that can be pinned to the world with one click from the
@@ -865,6 +892,8 @@ pub fn connection_handles(world: &World, body_idx: usize) -> Vec<(HandleRef, Vec
         let h = |end| HandleRef::Constraint { idx, end };
         if let Some(pj) = any.downcast_ref::<PinJoint>() {
             out.push((h(HandleEnd::Both), b[pj.body_a].world_point(pj.local_a)));
+        } else if let Some(wj) = any.downcast_ref::<WeldJoint>() {
+            out.push((h(HandleEnd::Both), b[wj.body_a].world_point(wj.local_a)));
         } else if let Some(pw) = any.downcast_ref::<PinWorld>() {
             out.push((h(HandleEnd::Both), pw.target));
         } else if let Some(sj) = any.downcast_ref::<SliderJoint>() {
@@ -908,6 +937,9 @@ pub fn move_handle(world: &mut World, handle: HandleRef, p: Vec2) {
             if let Some(pj) = any.downcast_mut::<PinJoint>() {
                 pj.local_a = world_to_local(&bodies[pj.body_a], p);
                 pj.local_b = world_to_local(&bodies[pj.body_b], p);
+            } else if let Some(wj) = any.downcast_mut::<WeldJoint>() {
+                wj.local_a = world_to_local(&bodies[wj.body_a], p);
+                wj.local_b = world_to_local(&bodies[wj.body_b], p);
             } else if let Some(pw) = any.downcast_mut::<PinWorld>() {
                 pw.local = world_to_local(&bodies[pw.body], p);
                 pw.target = p;

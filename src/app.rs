@@ -110,6 +110,9 @@ pub struct App {
     /// it loaded), so window resizes refit it. This also covers start-up,
     /// where the real window size often arrives after creation.
     camera_fitted: bool,
+    /// Where the camera last saw the followed body (`World::follow`), its
+    /// height eased; `None` restarts following from wherever it is.
+    follow_at: Option<Vec2>,
     fps_smooth:  f32,
     pub window_size: winit::dpi::PhysicalSize<u32>,
     pub frame_count: u64,
@@ -182,6 +185,7 @@ impl App {
             drag_candidate: None,
             last_frame: web_time::Instant::now(),
             camera_fitted: true,
+            follow_at: None,
             fps_smooth: 60.0,
             window_size: window.inner_size(),
             frame_count: 0,
@@ -214,6 +218,7 @@ impl App {
         w.add_force(MouseSpring(self.mouse_spring.clone()));
         w.integrator = self.editor.integrator;
         self.world = w;
+        self.follow_at = None;
         self.mouse_spring.lock().unwrap().active = false;
         self.picked = None;
         self.drag_candidate = None;
@@ -486,6 +491,26 @@ impl App {
         b.ang_vel = 0.0;
     }
 
+    /// Pan along with the followed body: its x exactly, its height eased so
+    /// a bouncing chassis doesn't shake the view. The editor leaves the
+    /// camera where it is.
+    fn follow_camera(&mut self, dt: f32) {
+        let body = self.world.follow.and_then(|i| self.world.bodies.get(i));
+        let (Some(b), false) = (body, self.editor.active) else {
+            self.follow_at = None;
+            return;
+        };
+        let p = b.pos32();
+        let Some(prev) = self.follow_at else {
+            self.follow_at = Some(p);
+            return;
+        };
+        let k = 1.0 - (-dt / 0.5).exp();
+        let next = Vec2::new(p.x, prev.y + (p.y - prev.y) * k);
+        self.camera.center += next - prev;
+        self.follow_at = Some(next);
+    }
+
     fn record_traces(&mut self) {
         let tracers = &self.world.tracers;
         if self.traces.len() != tracers.len() {
@@ -532,6 +557,7 @@ impl App {
         self.picked = None;
         self.drag_candidate = None;
         self.world = Self::build_scene(idx, self.mouse_spring.clone());
+        self.follow_at = None;
         self.anchor_ref_y = crate::scenes::free_com_y(&self.world);
         self.custom = None;
         self.custom_view = None;
@@ -1104,6 +1130,7 @@ impl App {
         if !self.editor.paused {
             self.record_traces();
         }
+        self.follow_camera(dt);
 
         self.frame_count += 1;
     }

@@ -9,9 +9,16 @@
 //! spring that gives way (slips) at μ·normal force, so a block on a slope
 //! below the friction angle stays put instead of creeping.
 //!
+//! The springs are tuned to the effective mass at each contact, taking a
+//! body welded into a larger piece (a tooth on a wheel) as that whole
+//! piece: tuned to the tooth alone, its contacts would be far too soft for
+//! the wheel behind it and let other parts sink through.
+//!
 //! Shapes: disks are circles, rods capsules (radius = half width); anchors
 //! (points) don't collide. Bodies joined by any constraint never collide
-//! with each other: joints overlap by design.
+//! with each other: joints overlap by design. Nor do bodies pinned at one
+//! node (a truss joint where several members are pinned in a chain at the
+//! same point), though not every pair there shares a pin.
 //!
 //! Belts with `GearJoint::collide` are surfaces too (a conveyor): each
 //! straight run a thin capsule moving with the pulley rims, the wrapped
@@ -25,6 +32,7 @@ use crate::sim::body::{Body, BodyShape};
 use crate::sim::slot::Slot;
 use crate::sim::constraint::Constraint;
 use crate::sim::constraints::gear::{belt_strands, GearJoint, GearKind, BELT_WIDTH};
+use crate::sim::constraints::{PinJoint, WeldJoint};
 
 /// Natural frequency of the contact springs (rad/s) and its cap in ω·dt,
 /// as for the slider end stops.
@@ -56,14 +64,37 @@ pub struct BeltSide { pub a: usize, pub b: usize, pub t: f64, pub pa: DVec2, pub
 #[derive(Clone, Copy, Debug)]
 struct Stick { i: usize, j: usize, feature: u8, s: f64 }
 
+/// A welded piece's mass properties (taken at the start of the step) and
+/// the bodies it is made of.
+#[derive(Clone, Debug)]
+struct Piece { inv_mass: f64, inv_inertia: f64, com: DVec2, members: Vec<usize> }
+
 #[derive(Default)]
 pub struct Contacts {
     /// Constrained pairs (i < j), which never collide.
     excluded: Vec<(usize, usize)>,
+    /// Pairs that were excluded until a joint between them broke or was
+    /// switched off: they overlap where the joint was, so they stay out of
+    /// contact until they have come apart (sorted).
+    separating: Vec<(usize, usize)>,
+    /// Body count the pair lists were made for.
+    n_bodies: usize,
     colliders: Vec<usize>,
+    /// Sweep-and-prune list: each collider's x extent and index, kept
+    /// sorted by (start, index) between calls so re-sorting is nearly free.
+    sweep: Vec<(f64, f64, usize)>,
+    /// The colliders `sweep` was built for.
+    sweep_of: Vec<usize>,
+    /// Candidate pairs (i < j) for this step, from the broad phase.
+    pairs: Vec<(usize, usize)>,
     /// Colliding belts' pulley pairs.
     belts: Vec<(usize, usize)>,
+    /// Sorted by (i, j, feature).
     sticks: Vec<Stick>,
+    /// For each body welded to others, the piece it belongs to (`None`:
+    /// a body on its own, which uses its own mass).
+    piece_of: Vec<Option<usize>>,
+    pieces: Vec<Piece>,
     scratch: Vec<ContactPoint>,
     /// Contacts at the end of the last step, for drawing.
     pub last: Vec<ContactPoint>,
@@ -115,6 +146,13 @@ fn segment(b: &Body) -> Option<(DVec2, DVec2, f64)> {
     Some((b.pos - u, b.pos + u, half_width as f64))
 }
 
+/// Bounding radius padded by how far the body can get within a step of
+/// `dt` (twice its current speed's worth, plus a hair), for the broad phase.
+fn reach(b: &Body, dt: f64) -> f64 {
+    let speed = b.vel.length() + b.ang_vel.abs() * bound_radius(b);
+    bound_radius(b) + 2.0 * speed * dt + 1e-3
+}
+
 fn bound_radius(b: &Body) -> f64 {
     match b.shape {
         BodyShape::Disk { radius } => radius as f64,
@@ -146,15 +184,23 @@ fn collide_capsule(bodies: &[Body], i: usize, j: usize, base: u8, (a, b, h): (DV
             push_contact(out, i, j, base, q, bj.pos, h, radius as f64, m);
         }
         BodyShape::Rod { .. } => {
+            // As for two rods: each end against the other segment, both
+            // ways (a ring round a pulley is all "end"), then the middles.
             let (a2, b2, h2) = segment(bj).unwrap();
+            let m2 = (b2 - a2).perp().normalize_or(DVec2::Y);
             let before = out.len();
             for (f, e) in [(0u8, a2), (1, b2)] {
                 let (q, _) = closest_on_segment(a, b, e);
                 push_contact(out, i, j, base + f, q, e, h, h2, m);
             }
+            for (f, e) in [(2u8, a), (3, b)] {
+                if f == 3 && a == b { continue; }
+                let (q, _) = closest_on_segment(a2, b2, e);
+                push_contact(out, i, j, base + f, e, q, h, h2, -m2);
+            }
             if out.len() == before {
                 let (c1, _, c2, _) = closest_segments(a, b, a2, b2);
-                push_contact(out, i, j, base + 2, c1, c2, h, h2, m);
+                push_contact(out, i, j, base + 4, c1, c2, h, h2, m);
             }
         }
         BodyShape::Point => {}
@@ -168,7 +214,7 @@ fn collide_belt(bodies: &[Body], a: usize, b: usize, k: usize, out: &mut Vec<Con
     let Some(runs) = belt_strands(&bodies[a], &bodies[b]) else { return };
     for (r, &(pa, pb)) in runs.iter().enumerate() {
         let before = out.len();
-        collide_capsule(bodies, a, k, 16 + 4 * r as u8, (pa, pb, 0.5 * BELT_WIDTH), out);
+        collide_capsule(bodies, a, k, 16 + 8 * r as u8, (pa, pb, 0.5 * BELT_WIDTH), out);
         let ab = pb - pa;
         for c in &mut out[before..] {
             let t = ((c.p - pa).dot(ab) / ab.length_squared().max(1e-18)).clamp(0.0, 1.0);
@@ -179,7 +225,7 @@ fn collide_belt(bodies: &[Body], a: usize, b: usize, k: usize, out: &mut Vec<Con
         let pulley = &bodies[p];
         let (true, Some(r)) = (!pulley.collide, disk_radius(pulley)) else { continue };
         let ring = (pulley.pos, pulley.pos, r + BELT_WIDTH);
-        collide_capsule(bodies, p, k, 24, ring, out);
+        collide_capsule(bodies, p, k, 32, ring, out);
     }
 }
 
@@ -231,8 +277,9 @@ fn collide_pair(bodies: &[Body], i: usize, j: usize, out: &mut Vec<ContactPoint>
 }
 
 impl Contacts {
-    /// Refresh the collider list and the constrained pairs. Once per step.
-    pub fn prepare(&mut self, bodies: &[Body], constraints: &[Slot<dyn Constraint>]) {
+    /// Refresh the collider list, the constrained pairs and the candidate
+    /// pairs for the step of length `dt` about to be taken. Once per step.
+    pub fn prepare(&mut self, bodies: &[Body], constraints: &[Slot<dyn Constraint>], dt: f64) {
         self.colliders.clear();
         self.colliders.extend((0..bodies.len()).filter(|&k| bodies[k].collide && !matches!(bodies[k].shape, BodyShape::Point)));
         self.belts.clear();
@@ -241,7 +288,12 @@ impl Contacts {
             .filter_map(|c| c.as_any().downcast_ref::<GearJoint>())
             .filter(|g| g.kind == GearKind::Belt && g.collide)
             .map(|g| (g.body_a, g.body_b)));
-        self.excluded.clear();
+        let before = std::mem::take(&mut self.excluded);
+        if bodies.len() != self.n_bodies {
+            self.separating.clear();
+            self.n_bodies = bodies.len();
+        }
+        self.pairs.clear();
         if !self.active() { return; }
         // A switched-off joint no longer holds its bodies apart from contact.
         for c in constraints.iter().filter(|c| c.on) {
@@ -252,8 +304,159 @@ impl Contacts {
                 }
             }
         }
+        self.exclude_pin_nodes(constraints);
         self.excluded.sort_unstable();
         self.excluded.dedup();
+        // Joints that just let go: their bodies come apart before touching.
+        let freed = before.iter().filter(|p| self.excluded.binary_search(p).is_err());
+        self.separating.extend(freed);
+        self.separating.sort_unstable();
+        self.separating.dedup();
+        self.find_pieces(bodies, constraints);
+        self.find_candidates(bodies, dt);
+    }
+
+    /// Group bodies welded together into pieces and take each piece's mass,
+    /// centre of mass and inertia about it. A piece with a fixed body in it
+    /// is immovable.
+    fn find_pieces(&mut self, bodies: &[Body], constraints: &[Slot<dyn Constraint>]) {
+        self.piece_of.clear();
+        self.pieces.clear();
+        let welds: Vec<(usize, usize)> = constraints.iter().filter(|c| c.on)
+            .filter_map(|c| c.as_any().downcast_ref::<WeldJoint>())
+            .filter(|w| w.body_a < bodies.len() && w.body_b < bodies.len())
+            .map(|w| (w.body_a, w.body_b))
+            .collect();
+        if welds.is_empty() { return; }
+        let mut parent: Vec<usize> = (0..bodies.len()).collect();
+        fn root(p: &mut [usize], mut i: usize) -> usize {
+            while p[i] != i { p[i] = p[p[i]]; i = p[i]; }
+            i
+        }
+        for &(a, b) in &welds {
+            let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+            parent[ra] = rb;
+        }
+        self.piece_of.resize(bodies.len(), None);
+        let mut index_of_root = vec![usize::MAX; bodies.len()];
+        // Mass and first moment, then the inertia about the centre.
+        let mut sums: Vec<(f64, DVec2, bool)> = Vec::new();
+        let welded: Vec<usize> = {
+            let mut v: Vec<usize> = welds.iter().flat_map(|&(a, b)| [a, b]).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        for &k in &welded {
+            let r = root(&mut parent, k);
+            if index_of_root[r] == usize::MAX {
+                index_of_root[r] = sums.len();
+                sums.push((0.0, DVec2::ZERO, false));
+            }
+            let g = index_of_root[r];
+            self.piece_of[k] = Some(g);
+            let b = &bodies[k];
+            sums[g].0 += b.mass as f64;
+            sums[g].1 += b.mass as f64 * b.pos;
+            sums[g].2 |= b.fixed;
+        }
+        self.pieces = sums.iter().map(|&(m, mp, fixed)| Piece {
+            inv_mass: if fixed { 0.0 } else { 1.0 / m },
+            inv_inertia: 0.0,
+            com: mp / m,
+            members: Vec::new(),
+        }).collect();
+        for &k in &welded {
+            let g = self.piece_of[k].unwrap();
+            self.pieces[g].members.push(k);
+        }
+        let mut inertia = vec![0.0f64; self.pieces.len()];
+        for &k in &welded {
+            let g = self.piece_of[k].unwrap();
+            let b = &bodies[k];
+            inertia[g] += b.inertia as f64 + b.mass as f64 * (b.pos - self.pieces[g].com).length_squared();
+        }
+        for (p, i) in self.pieces.iter_mut().zip(inertia) {
+            if p.inv_mass > 0.0 { p.inv_inertia = 1.0 / i; }
+        }
+    }
+
+    /// Apply a contact force on body `k` at `p`. A body welded into a piece
+    /// passes it to the whole piece as one rigid body: each member gets the
+    /// share that moves it with the piece (m·a at its centre, I·α), so the
+    /// welds carry nothing extra and a light part never takes the full
+    /// push of a contact tuned to the heavy piece behind it.
+    fn push(&self, bodies: &mut [Body], k: usize, f: DVec2, p: DVec2) {
+        let Some(g) = self.piece_of.get(k).copied().flatten() else {
+            bodies[k].apply_force_at_world_point(f, p);
+            return;
+        };
+        let pc = &self.pieces[g];
+        if pc.inv_mass == 0.0 { return; }
+        let a = f * pc.inv_mass;
+        let alpha = (p - pc.com).perp_dot(f) * pc.inv_inertia;
+        for &i in &pc.members {
+            let b = &mut bodies[i];
+            if b.fixed { continue; }
+            let r = b.pos - pc.com;
+            b.force_accum += b.mass as f64 * (a + alpha * r.perp());
+            b.torque_accum += b.inertia as f64 * alpha;
+        }
+    }
+
+    /// Inverse effective mass of body `k` (or its welded piece) for a push
+    /// along `d` at `p`.
+    fn mobility(&self, bodies: &[Body], k: usize, p: DVec2, d: DVec2) -> f64 {
+        match self.piece_of.get(k).copied().flatten() {
+            Some(g) => {
+                let pc = &self.pieces[g];
+                let rn = (p - pc.com).perp_dot(d);
+                pc.inv_mass + pc.inv_inertia * rn * rn
+            }
+            None => {
+                let b = &bodies[k];
+                let rn = (p - b.pos).perp_dot(d);
+                b.inv_mass() + b.inv_inertia() * rn * rn
+            }
+        }
+    }
+
+    /// Exclude every pair of bodies that meet at one pin node: pin and weld
+    /// ends are merged (union–find) by the joints joining them, keyed by
+    /// body and local point.
+    fn exclude_pin_nodes(&mut self, constraints: &[Slot<dyn Constraint>]) {
+        let key = |b: usize, p: glam::Vec2| (b, (p.x * 1e4).round() as i64, (p.y * 1e4).round() as i64);
+        let joints: Vec<_> = constraints.iter().filter(|c| c.on).filter_map(|c| {
+            let any = c.as_any();
+            if let Some(p) = any.downcast_ref::<PinJoint>() {
+                Some((key(p.body_a, p.local_a), key(p.body_b, p.local_b)))
+            } else {
+                any.downcast_ref::<WeldJoint>().map(|p| (key(p.body_a, p.local_a), key(p.body_b, p.local_b)))
+            }
+        }).collect();
+        if joints.len() < 2 { return; }
+        let mut ends: Vec<_> = joints.iter().flat_map(|&(a, b)| [a, b]).collect();
+        ends.sort_unstable();
+        ends.dedup();
+        let id = |k| ends.binary_search(&k).unwrap();
+        let mut parent: Vec<usize> = (0..ends.len()).collect();
+        fn root(p: &mut [usize], mut i: usize) -> usize {
+            while p[i] != i { p[i] = p[p[i]]; i = p[i]; }
+            i
+        }
+        for &(a, b) in &joints {
+            let (ra, rb) = (root(&mut parent, id(a)), root(&mut parent, id(b)));
+            parent[ra] = rb;
+        }
+        let mut nodes: Vec<(usize, usize)> = (0..ends.len()).map(|i| (root(&mut parent, i), ends[i].0)).collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        for (x, &(r, a)) in nodes.iter().enumerate() {
+            for &(r2, b) in nodes[x + 1..].iter().take_while(|n| n.0 == r) {
+                debug_assert_eq!(r, r2);
+                if a != b { self.excluded.push((a.min(b), a.max(b))); }
+            }
+        }
     }
 
     pub fn active(&self) -> bool {
@@ -264,39 +467,73 @@ impl Contacts {
         self.excluded.binary_search(&(a.min(b), a.max(b))).is_ok()
     }
 
-    fn detect(&self, bodies: &[Body], out: &mut Vec<ContactPoint>) {
-        out.clear();
-        let cs = &self.colliders;
-        for (x, &i) in cs.iter().enumerate() {
-            let (bi, ri) = (&bodies[i], bound_radius(&bodies[i]));
-            for &j in &cs[x + 1..] {
-                let bj = &bodies[j];
-                if bi.fixed && bj.fixed { continue; }
-                let reach = ri + bound_radius(bj);
+    /// Broad phase, once per step: every pair whose bounds, padded by how
+    /// far each body can move in `dt`, overlap. The integrator stages and
+    /// the end-of-step update then only run the exact tests on these.
+    fn find_candidates(&mut self, bodies: &[Body], dt: f64) {
+        self.pairs.clear();
+        self.sort_sweep(bodies, dt);
+        let sw = &self.sweep;
+        for (x, &(_, hi, a)) in sw.iter().enumerate() {
+            for &(lo_b, _, b) in &sw[x + 1..] {
+                if lo_b > hi { break; }
+                let (i, j) = (a.min(b), a.max(b));
+                let (bi, bj) = (&bodies[i], &bodies[j]);
+                if (bi.fixed && bj.fixed) || !bi.shares_plane(bj) { continue; }
+                let reach = reach(bi, dt) + reach(bj, dt);
                 if (bj.pos - bi.pos).length_squared() > reach * reach { continue; }
                 if self.excluded.binary_search(&(i, j)).is_ok() { continue; }
-                collide_pair(bodies, i, j, out);
+                self.pairs.push((i, j));
             }
         }
+    }
+
+    fn detect(&self, bodies: &[Body], out: &mut Vec<ContactPoint>) {
+        out.clear();
+        for &(i, j) in &self.pairs {
+            if self.separating.binary_search(&(i, j)).is_ok() { continue; }
+            collide_pair(bodies, i, j, out);
+        }
+        let cs = &self.colliders;
         for &(a, b) in &self.belts {
             for &k in cs {
                 if k == a || k == b || self.excluded_pair(a, k) || self.excluded_pair(b, k) { continue; }
                 if bodies[k].fixed && bodies[a].fixed && bodies[b].fixed { continue; }
+                if !bodies[k].shares_plane(&bodies[a]) { continue; }
                 collide_belt(bodies, a, b, k, out);
+            }
+        }
+    }
+
+    /// Refresh each collider's padded x extent and restore the order.
+    /// Bodies move little per step, so an insertion sort is close to linear.
+    fn sort_sweep(&mut self, bodies: &[Body], dt: f64) {
+        if self.sweep_of != self.colliders {
+            self.sweep_of.clone_from(&self.colliders);
+            self.sweep.clear();
+            self.sweep.extend(self.colliders.iter().map(|&k| (0.0, 0.0, k)));
+        }
+        for s in self.sweep.iter_mut() {
+            let b = &bodies[s.2];
+            let r = reach(b, dt);
+            *s = (b.pos.x - r, b.pos.x + r, s.2);
+        }
+        let key = |s: &(f64, f64, usize)| (s.0, s.2);
+        for k in 1..self.sweep.len() {
+            let mut m = k;
+            while m > 0 && key(&self.sweep[m - 1]).partial_cmp(&key(&self.sweep[m])) == Some(std::cmp::Ordering::Greater) {
+                self.sweep.swap(m - 1, m);
+                m -= 1;
             }
         }
     }
 
     /// Inverse effective mass of side i along `d` (body, or a belt run
     /// through its two pulleys).
-    fn w_i(bodies: &[Body], c: &ContactPoint, d: DVec2) -> f64 {
-        let w = |b: &Body, p: DVec2| {
-            let rn = (p - b.pos).perp_dot(d);
-            b.inv_mass() + b.inv_inertia() * rn * rn
-        };
+    fn w_i(&self, bodies: &[Body], c: &ContactPoint, d: DVec2) -> f64 {
         match c.belt {
-            Some(s) => (1.0 - s.t).powi(2) * w(&bodies[s.a], s.pa) + s.t.powi(2) * w(&bodies[s.b], s.pb),
-            None => w(&bodies[c.i], c.p),
+            Some(s) => (1.0 - s.t).powi(2) * self.mobility(bodies, s.a, s.pa, d) + s.t.powi(2) * self.mobility(bodies, s.b, s.pb, d),
+            None => self.mobility(bodies, c.i, c.p, d),
         }
     }
 
@@ -327,9 +564,7 @@ impl Contacts {
 
     /// Spring rate and damping along direction `d` at point `p`.
     fn gains(&self, bodies: &[Body], c: &ContactPoint, d: DVec2, dt: f64, zeta: f64) -> Option<(f64, f64)> {
-        let bj = &bodies[c.j];
-        let rn = (c.p - bj.pos).perp_dot(d);
-        let w_eff = Self::w_i(bodies, c, d) + bj.inv_mass() + bj.inv_inertia() * rn * rn;
+        let w_eff = self.w_i(bodies, c, d) + self.mobility(bodies, c.j, c.p, d);
         if w_eff <= 0.0 { return None; }
         let omega = OMEGA.min(MAX_OMEGA_DT / dt);
         Some((omega * omega / w_eff, 2.0 * zeta * omega / w_eff))
@@ -349,9 +584,8 @@ impl Contacts {
     }
 
     fn stick(&self, c: &ContactPoint) -> f64 {
-        self.sticks.iter()
-            .find(|s| s.i == c.i && s.j == c.j && s.feature == c.feature)
-            .map_or(0.0, |s| s.s)
+        self.sticks.binary_search_by_key(&(c.i, c.j, c.feature), |s| (s.i, s.j, s.feature))
+            .map_or(0.0, |k| self.sticks[k].s)
     }
 
     /// Normal and friction force magnitudes (on `j`) at the current state.
@@ -375,13 +609,13 @@ impl Contacts {
         for c in &pts {
             let (f_n, f_t) = self.forces(bodies, c, self.stick(c), dt);
             let f = c.n * f_n + c.n.perp() * f_t;
-            bodies[c.j].apply_force_at_world_point(f, c.p);
+            self.push(bodies, c.j, f, c.p);
             match c.belt {
                 Some(s) => {
-                    bodies[s.a].apply_force_at_world_point(-f * (1.0 - s.t), s.pa);
-                    bodies[s.b].apply_force_at_world_point(-f * s.t, s.pb);
+                    self.push(bodies, s.a, -f * (1.0 - s.t), s.pa);
+                    self.push(bodies, s.b, -f * s.t, s.pb);
                 }
-                None => bodies[c.i].apply_force_at_world_point(-f, c.p),
+                None => self.push(bodies, c.i, -f, c.p),
             }
         }
         self.scratch = pts;
@@ -415,14 +649,24 @@ impl Contacts {
             c.f_t = f_t;
             next.push(Stick { i: c.i, j: c.j, feature: c.feature, s });
         }
+        next.sort_unstable_by_key(|s| (s.i, s.j, s.feature));
         self.sticks = next;
         self.last = pts;
+        // Parts freed by a joint rejoin contact once they no longer overlap.
+        let mut probe = std::mem::take(&mut self.scratch);
+        self.separating.retain(|&(i, j)| {
+            probe.clear();
+            collide_pair(bodies, i, j, &mut probe);
+            !probe.is_empty()
+        });
+        self.scratch = probe;
     }
 
     /// Forget stick state (after the editor or a rewind teleports bodies).
     pub fn reset(&mut self) {
         self.sticks.clear();
         self.last.clear();
+        self.separating.clear();
     }
 }
 
@@ -526,6 +770,22 @@ mod tests {
         w.add_constraint(crate::sim::constraints::PinJoint::new(a, Vec2::new(0.3, 0.0), b, Vec2::ZERO));
         w.step(0.001);
         assert!(w.contacts.last.is_empty());
+    }
+
+    /// Three rods pinned in a chain at one node (A–B, B–C): A and C share
+    /// no pin but meet there, so they don't collide either.
+    #[test]
+    fn pin_node_members_ignored() {
+        use crate::sim::constraints::PinJoint;
+        let mut w = World::new();
+        let ids: Vec<usize> = [0.0f32, 0.7, -0.7].iter()
+            .map(|&a| w.add_body(block(Vec2::new(0.3 * a.cos(), 0.3 * a.sin()), a)))
+            .collect();
+        let end = Vec2::new(-0.3, 0.0);
+        w.add_constraint(PinJoint::new(ids[0], end, ids[1], end));
+        w.add_constraint(PinJoint::new(ids[1], end, ids[2], end));
+        w.step(0.001);
+        assert!(w.contacts.last.is_empty(), "{:?}", w.contacts.last.iter().map(|c| (c.i, c.j)).collect::<Vec<_>>());
     }
 
     /// A block dropped on a running conveyor belt is picked up to belt
