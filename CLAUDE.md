@@ -19,6 +19,8 @@ Web build needs the wasm target and trunk (Arch: `pacman -S rust-wasm trunk`). I
 
 The app opens a wgpu window. Pan with middle-mouse drag, zoom with scroll wheel. Left-click drag to pull bodies with a mouse spring.
 
+Touch (`App::on_touch`; winit delivers touch as `WindowEvent::Touch`, never as mouse events): egui sees every finger; one that lands off the panels (`Hud::is_over_ui`, a layer hit test that needs no prior hover) is replayed into `App::scene_event` as the left mouse button, so picking, the mouse spring and editor gestures work unchanged. A second finger cancels that press and the pair pans and pinch-zooms; outside the editor one finger on empty space pans. The Parts window's CONNECT switch (`Editor::connect_mode`) stands in for Shift when picking connections. `index.html` sets `touch-action: none` on the canvas.
+
 ## Architecture
 
 Single Rust binary. Top-level modules: `sim` (physics), `renderer` (wgpu + egui), `scenes` (scene definitions), `app` (input/update/render loop), `editor`, `analysis` (rewind, butterfly, phase plot, undo), `scene_file` (save/load/share).

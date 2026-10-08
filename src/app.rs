@@ -102,6 +102,12 @@ pub struct App {
     last_mouse_pos: Vec2,
     ctrl_held:      bool,
     shift_held:     bool,
+    /// Fingers down in the scene (touch id, window position), at most two.
+    /// One finger is the left mouse button; two pan and pinch-zoom.
+    touches:        Vec<(u64, Vec2)>,
+    /// The fingers down only move the camera: a pinch happened, or (outside
+    /// the editor) the first finger landed on empty space.
+    touch_pans:     bool,
     /// Body pressed in editor but not yet dragged (becomes Dragging only after movement)
     drag_candidate: Option<usize>,
 
@@ -181,6 +187,8 @@ impl App {
             middle_pressed: false,
             last_mouse_pos: Vec2::ZERO,
             shift_held: false,
+            touches: Vec::new(),
+            touch_pans: false,
             ctrl_held: false,
             drag_candidate: None,
             last_frame: web_time::Instant::now(),
@@ -710,7 +718,7 @@ impl App {
             }
 
             EditorMode::Idle | EditorMode::Inspecting { .. } => {
-                if self.shift_held {
+                if self.connecting() {
                     if let Some((idx, _local)) = self.pick_body(raw) {
                         self.editor.mode = EditorMode::FirstSelected {
                             body_idx:  idx,
@@ -735,6 +743,7 @@ impl App {
                         self.editor.pair_can_roll = crate::editor::can_roll(fa, fb);
                         self.editor.pair_can_slide = crate::editor::can_slide(fa, fb);
                         self.editor.pair_can_gear = crate::editor::can_gear(fa, fb);
+                        self.editor.connect_mode = false;
                         self.editor.mode = EditorMode::BothSelected {
                             body_a:   first,
                             attach_a,
@@ -804,10 +813,95 @@ impl App {
         if let WindowEvent::CursorMoved { position, .. } = event {
             self.mouse_pos = Vec2::new(position.x as f32, position.y as f32);
         }
+        if let WindowEvent::Touch(t) = event {
+            self.on_touch(t);
+            return true;
+        }
         if self.hud.on_window_event(self.window, event) {
             return true;
         }
+        self.scene_event(event)
+    }
 
+    /// Shift is held, or the CONNECT switch (Shift for touch screens) is on.
+    fn connecting(&self) -> bool {
+        self.shift_held || self.editor.connect_mode
+    }
+
+    /// Touch input. egui sees every finger (its first one is its pointer);
+    /// a finger that lands off the panels is ours until it lifts. The first
+    /// is replayed as the left mouse button, so picking, the mouse spring
+    /// and every editor gesture work unchanged; a second finger cancels
+    /// that press and the pair pans and pinch-zooms the camera. Outside the
+    /// editor, one finger on empty space pans.
+    fn on_touch(&mut self, t: &winit::event::Touch) {
+        use winit::{dpi::PhysicalPosition, event::TouchPhase};
+        self.hud.on_window_event(self.window, &WindowEvent::Touch(*t));
+        let pos = Vec2::new(t.location.x as f32, t.location.y as f32);
+        let device_id = t.device_id;
+        let at = PhysicalPosition::new(t.location.x, t.location.y);
+        let moved = WindowEvent::CursorMoved { device_id, position: at };
+        let button = |state| WindowEvent::MouseInput { device_id, state, button: MouseButton::Left };
+        let ours = self.touches.iter().position(|(id, _)| *id == t.id);
+        if ours.is_none() && self.touches.len() < 2 {
+            // A part dragged out of the palette follows the finger.
+            self.mouse_pos = pos;
+        }
+
+        match t.phase {
+            TouchPhase::Started => {
+                if ours.is_some() || self.touches.len() >= 2 || self.hud.is_over_ui(pos) { return; }
+                self.touches.push((t.id, pos));
+                if self.touches.len() == 1 {
+                    self.scene_event(&moved);
+                    let wp = self.world_mouse();
+                    self.touch_pans = !self.editor.active && self.pick_body(wp).is_none();
+                    if !self.touch_pans { self.scene_event(&button(ElementState::Pressed)); }
+                } else if !self.touch_pans {
+                    // Second finger: drop the first one's press.
+                    self.drag_candidate = None;
+                    if matches!(self.editor.mode, EditorMode::BoxSelecting { .. }) {
+                        self.editor.mode = EditorMode::Idle;
+                    }
+                    self.scene_event(&button(ElementState::Released));
+                    self.touch_pans = true;
+                }
+            }
+            TouchPhase::Moved => {
+                let Some(i) = ours else { return };
+                let old = self.touches.clone();
+                self.touches[i].1 = pos;
+                if !self.touch_pans {
+                    self.scene_event(&moved);
+                } else if old.len() == 1 {
+                    self.camera.pan(pos - old[0].1);
+                    self.camera_fitted = false;
+                } else {
+                    let (a0, b0) = (old[0].1, old[1].1);
+                    let (a1, b1) = (self.touches[0].1, self.touches[1].1);
+                    let (c0, c1) = ((a0 + b0) * 0.5, (a1 + b1) * 0.5);
+                    self.camera.pan(c1 - c0);
+                    let (d0, d1) = ((a0 - b0).length(), (a1 - b1).length());
+                    if d0 > 1.0 && d1 > 1.0 {
+                        self.camera.zoom(d0 / d1, c1, self.screen_size());
+                    }
+                    self.camera_fitted = false;
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                let Some(i) = ours else { return };
+                self.touches.remove(i);
+                if !self.touch_pans {
+                    self.scene_event(&moved);
+                    self.scene_event(&button(ElementState::Released));
+                }
+                if self.touches.is_empty() { self.touch_pans = false; }
+            }
+        }
+    }
+
+    /// Input meant for the scene (egui has passed on it).
+    fn scene_event(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::Resized(size) => self.resize(*size),
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key, state, .. }, .. } => {
@@ -956,7 +1050,7 @@ impl App {
                                     }
                                 }
                                 // Pressing a body of the group moves the group.
-                                if !self.shift_held && matches!(self.editor.mode, EditorMode::Selection) {
+                                if !self.connecting() && matches!(self.editor.mode, EditorMode::Selection) {
                                     if let Some(idx) = self.pick_body(wp).map(|(i, _)| i).filter(|i| self.editor.selection.contains(i)) {
                                         self.editor.mode = EditorMode::GroupDragging { last: wp, start: wp, body: idx };
                                         return false;
@@ -964,7 +1058,7 @@ impl App {
                                 }
                                 // In body-moveable modes without shift: record a drag candidate.
                                 // The candidate becomes a real drag on movement, or a click on release.
-                                if !self.shift_held
+                                if !self.connecting()
                                     && !matches!(self.editor.mode,
                                         EditorMode::PlacingBody
                                         | EditorMode::PlacingTrace { .. }
@@ -979,7 +1073,7 @@ impl App {
                                     }
                                 }
                                 // Empty space: start a box selection.
-                                if !self.shift_held
+                                if !self.connecting()
                                     && matches!(self.editor.mode, EditorMode::Idle | EditorMode::Inspecting { .. } | EditorMode::Selection)
                                     && self.pick_body(wp).is_none()
                                 {
@@ -1143,7 +1237,7 @@ impl App {
             self.build_gallery();
         }
 
-        self.editor.connect_ready = self.editor.active && self.shift_held
+        self.editor.connect_ready = self.editor.active && self.connecting()
             && matches!(self.editor.mode, EditorMode::Idle | EditorMode::Inspecting { .. });
 
         // Build geometry

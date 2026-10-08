@@ -447,6 +447,9 @@ pub struct Editor {
     /// Shift is held where a click would pick a connection's first body
     /// (set by the app each frame; shown in the scene and the status line).
     pub connect_ready:       bool,
+    /// The Parts window's CONNECT switch: acts as a held Shift for picking
+    /// connections, for touch screens. Off again once two bodies are picked.
+    pub connect_mode:        bool,
 }
 
 /// How the number of physics steps per frame is chosen.
@@ -493,6 +496,7 @@ impl Default for Editor {
             torsion_d:          0.5,
             link_hover:         None,
             connect_ready:      false,
+            connect_mode:       false,
             selection:          Vec::new(),
             can_paste:          false,
             show_body_list:     false,

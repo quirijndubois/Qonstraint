@@ -166,6 +166,14 @@ impl Hud {
         self.winit_state.on_window_event(window, event).consumed
     }
 
+    /// A panel covers this window point (physical pixels). Unlike egui's
+    /// own pointer checks it needs no hover beforehand, so it is right for
+    /// a finger that has just touched down.
+    pub fn is_over_ui(&self, pos: glam::Vec2) -> bool {
+        let ppp = self.ctx.pixels_per_point();
+        self.ctx.layer_id_at(egui::pos2(pos.x / ppp, pos.y / ppp)).is_some()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn encode(
         &mut self,
@@ -533,6 +541,14 @@ fn parts_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &World, u
             }
         }
     });
+    // Shift for touch screens: while on, a tap picks a connection's bodies.
+    ui.add_space(6.0);
+    if hud_btn(ui, "CONNECT", editor.connect_mode, ui.available_width())
+        .on_hover_text("Tap two bodies to connect them (same as Shift-click)")
+        .clicked()
+    {
+        editor.connect_mode = !editor.connect_mode;
+    }
     if editor.can_paste {
         ui.add_space(6.0);
         if hud_btn(ui, "PASTE", false, ui.available_width()).clicked() { out.paste = true; }
