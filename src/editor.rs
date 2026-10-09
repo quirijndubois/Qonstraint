@@ -450,6 +450,11 @@ pub struct Editor {
     /// The Parts window's CONNECT switch: acts as a held Shift for picking
     /// connections, for touch screens. Off again once two bodies are picked.
     pub connect_mode:        bool,
+    /// HUD windows folded to their title row. The main panel's is `None`
+    /// until the user folds or unfolds it: folded on narrow screens.
+    pub main_folded:         Option<bool>,
+    pub parts_folded:        bool,
+    pub selection_folded:    bool,
 }
 
 /// How the number of physics steps per frame is chosen.
@@ -497,6 +502,9 @@ impl Default for Editor {
             link_hover:         None,
             connect_ready:      false,
             connect_mode:       false,
+            main_folded:        None,
+            parts_folded:       false,
+            selection_folded:   false,
             selection:          Vec::new(),
             can_paste:          false,
             show_body_list:     false,

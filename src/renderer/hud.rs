@@ -166,12 +166,15 @@ impl Hud {
         self.winit_state.on_window_event(window, event).consumed
     }
 
-    /// A panel covers this window point (physical pixels). Unlike egui's
+    /// A window covers this point (physical pixels). Unlike egui's
     /// own pointer checks it needs no hover beforehand, so it is right for
     /// a finger that has just touched down.
     pub fn is_over_ui(&self, pos: glam::Vec2) -> bool {
         let ppp = self.ctx.pixels_per_point();
-        self.ctx.layer_id_at(egui::pos2(pos.x / ppp, pos.y / ppp)).is_some()
+        // egui registers the whole screen as a background layer; only the
+        // windows above it count.
+        self.ctx.layer_id_at(egui::pos2(pos.x / ppp, pos.y / ppp))
+            .is_some_and(|l| l.order != egui::Order::Background)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -323,16 +326,25 @@ fn draw_main_panel(
     library:     &mut Library,
 ) -> HudOutput {
     let mut out = HudOutput::default();
+    // Folded by default on a phone, where it would cover the whole scene.
+    let mut folded = editor.main_folded.unwrap_or_else(|| narrow(ctx));
 
     egui::Area::new(egui::Id::new("hud"))
         .fixed_pos(egui::pos2(16.0, 16.0))
         .show(ctx, |ui| {
             panel_frame().show(ui, |ui| {
-                ui.set_width(340.0);
+                ui.set_width(panel_width(ctx, 340.0));
 
                 // Title + scene files
-                ui.label(text(scene_name, TITLE_SIZE, WHITE));
-                ui.label(text(scene_desc, SMALL_SIZE, MUTED));
+                ui.horizontal(|ui| {
+                    ui.label(text(scene_name, TITLE_SIZE, WHITE));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let was = folded;
+                        fold_button(ui, &mut folded);
+                        if folded != was { editor.main_folded = Some(folded); }
+                    });
+                });
+                if !folded { ui.label(text(scene_desc, SMALL_SIZE, MUTED)); }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let w = equal_width(ui, 3);
@@ -363,6 +375,7 @@ fn draw_main_panel(
                     }
                 });
 
+                if folded { return; }
                 ui.add_space(10.0);
 
                 // INFO
@@ -450,11 +463,16 @@ fn sparkline(ui: &mut egui::Ui, history: &VecDeque<f32>) {
 /// (changing what's there). The second sits at the first's measured bottom.
 fn draw_editor_panel(ctx: &egui::Context, editor: &mut Editor, world: &mut World, undo: UndoState, out: &mut HudOutput) {
     let screen = ctx.screen_rect();
+    // On a phone, under the main panel rather than over it.
+    let parts_top = match ctx.memory(|m| m.area_rect(egui::Id::new("hud"))) {
+        Some(main) if narrow(ctx) => main.bottom() + 12.0 - screen.top(),
+        _ => 16.0,
+    };
     let parts = egui::Area::new(egui::Id::new("editor_panel"))
-        .anchor(Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+        .anchor(Align2::RIGHT_TOP, egui::vec2(-16.0, parts_top))
         .show(ctx, |ui| {
             panel_frame().show(ui, |ui| {
-                ui.set_width(270.0);
+                ui.set_width(panel_width(ctx, 270.0));
                 parts_panel_contents(ui, editor, world, undo, out);
             });
         });
@@ -468,8 +486,14 @@ fn draw_editor_panel(ctx: &egui::Context, editor: &mut Editor, world: &mut World
             // Never past the window bottom; overflow scrolls.
             let max_h = (screen.bottom() - top - 16.0 - 24.0).max(120.0);
             panel_frame().show(ui, |ui| {
-                ui.set_width(270.0);
-                ui.label(text(title, TITLE_SIZE, WHITE));
+                ui.set_width(panel_width(ctx, 270.0));
+                ui.horizontal(|ui| {
+                    ui.label(text(title, TITLE_SIZE, WHITE));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        fold_button(ui, &mut editor.selection_folded);
+                    });
+                });
+                if editor.selection_folded { return; }
                 ui.add_space(8.0);
                 // Grow with the content; only scroll once it would pass the
                 // window bottom. Without min_scrolled_height egui may shrink
@@ -503,6 +527,7 @@ fn parts_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &World, u
     ui.horizontal(|ui| {
         ui.label(text("Parts", TITLE_SIZE, WHITE));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            fold_button(ui, &mut editor.parts_folded);
             if dim_btn(ui, "REDO", undo.can_redo).clicked() { out.redo = true; }
             if dim_btn(ui, "UNDO", undo.can_undo).clicked() { out.undo = true; }
             if icon_square(ui, Icon::List, editor.show_body_list).on_hover_text("List every part in the scene").clicked() {
@@ -510,6 +535,7 @@ fn parts_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &World, u
             }
         });
     });
+    if editor.parts_folded { return; }
     ui.add_space(8.0);
 
     // Drag a tile into the scene (or click it, then click the scene). New
@@ -622,6 +648,24 @@ fn icon_square(ui: &mut egui::Ui, icon: Icon, active: bool) -> egui::Response {
     ui.painter().rect(rect, Rounding::ZERO, bg, Stroke::new(BORDER_W, WHITE));
     paint_icon(ui.painter(), rect.shrink(4.0), icon, fg);
     resp
+}
+
+/// Square chevron that folds a window down to its title row and back.
+fn fold_button(ui: &mut egui::Ui, folded: &mut bool) {
+    let icon = if *folded { Icon::Unfold } else { Icon::Fold };
+    let tip = if *folded { "Show the whole window" } else { "Fold the window to its title" };
+    if icon_square(ui, icon, false).on_hover_text(tip).clicked() { *folded = !*folded; }
+}
+
+/// Window inner width: `want`, or less on a screen too narrow for it.
+fn panel_width(ctx: &egui::Context, want: f32) -> f32 {
+    want.min(ctx.screen_rect().width() - 32.0 - 24.0).max(160.0)
+}
+
+/// Too narrow for the main panel and the editor windows side by side (a
+/// phone): the editor windows stack under the main panel instead.
+fn narrow(ctx: &egui::Context) -> bool {
+    ctx.screen_rect().width() < 340.0 + 270.0 + 3.0 * 16.0 + 4.0 * 12.0
 }
 
 /// Selection window: whatever is selected (one body, a group) or being
@@ -976,7 +1020,7 @@ fn gallery_tile(ui: &mut egui::Ui, tile: &Tile, is_current: bool, out: &mut HudO
 }
 
 #[derive(Clone, Copy)]
-enum Icon { New, Load, Save, Delete, Power, List, Disk, Rod, Anchor }
+enum Icon { New, Load, Save, Delete, Power, List, Disk, Rod, Anchor, Fold, Unfold }
 
 /// Line icons drawn in `r` on a 16 × 16 design grid, in the HUD's flat style.
 fn paint_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, color: Color32) {
@@ -1016,6 +1060,13 @@ fn paint_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, color: Color32) {
                 .collect();
             p.add(egui::Shape::line(pts, st));
             p.line_segment([at(8.0, 1.5), at(8.0, 8.0)], st);
+        }
+        Icon::Fold => {
+            // Chevron up: fold the window away.
+            p.add(egui::Shape::line(vec![at(3.0, 10.5), at(8.0, 5.5), at(13.0, 10.5)], st));
+        }
+        Icon::Unfold => {
+            p.add(egui::Shape::line(vec![at(3.0, 5.5), at(8.0, 10.5), at(13.0, 5.5)], st));
         }
         Icon::List => {
             for y in [3.5, 8.0, 12.5] {

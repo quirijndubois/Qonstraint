@@ -108,6 +108,12 @@ pub struct App {
     /// The fingers down only move the camera: a pinch happened, or (outside
     /// the editor) the first finger landed on empty space.
     touch_pans:     bool,
+    /// Editor mode before the first finger pressed, restored if a second
+    /// finger cancels a box select it started.
+    touch_prev_mode: Option<EditorMode>,
+    /// The last finger lifted and no mouse has moved since: nothing points
+    /// at the scene, so hover hints aren't drawn.
+    pointer_gone:   bool,
     /// Body pressed in editor but not yet dragged (becomes Dragging only after movement)
     drag_candidate: Option<usize>,
 
@@ -189,6 +195,8 @@ impl App {
             shift_held: false,
             touches: Vec::new(),
             touch_pans: false,
+            touch_prev_mode: None,
+            pointer_gone: false,
             ctrl_held: false,
             drag_candidate: None,
             last_frame: web_time::Instant::now(),
@@ -812,6 +820,7 @@ impl App {
         // palette follows it.
         if let WindowEvent::CursorMoved { position, .. } = event {
             self.mouse_pos = Vec2::new(position.x as f32, position.y as f32);
+            self.pointer_gone = false;
         }
         if let WindowEvent::Touch(t) = event {
             self.on_touch(t);
@@ -849,6 +858,12 @@ impl App {
         }
 
         match t.phase {
+            TouchPhase::Started => self.pointer_gone = false,
+            TouchPhase::Ended | TouchPhase::Cancelled => self.pointer_gone = true,
+            TouchPhase::Moved => {}
+        }
+
+        match t.phase {
             TouchPhase::Started => {
                 if ours.is_some() || self.touches.len() >= 2 || self.hud.is_over_ui(pos) { return; }
                 self.touches.push((t.id, pos));
@@ -856,12 +871,13 @@ impl App {
                     self.scene_event(&moved);
                     let wp = self.world_mouse();
                     self.touch_pans = !self.editor.active && self.pick_body(wp).is_none();
+                    self.touch_prev_mode = Some(self.editor.mode.clone());
                     if !self.touch_pans { self.scene_event(&button(ElementState::Pressed)); }
                 } else if !self.touch_pans {
                     // Second finger: drop the first one's press.
                     self.drag_candidate = None;
                     if matches!(self.editor.mode, EditorMode::BoxSelecting { .. }) {
-                        self.editor.mode = EditorMode::Idle;
+                        self.editor.mode = self.touch_prev_mode.take().unwrap_or(EditorMode::Idle);
                     }
                     self.scene_event(&button(ElementState::Released));
                     self.touch_pans = true;
@@ -1501,7 +1517,7 @@ impl App {
         // Hover hint when not already busy with a body. Connecting (Shift
         // held, or a first body picked) shows in red, with the attach point.
         let connecting = self.editor.connect_ready || matches!(self.editor.mode, EditorMode::FirstSelected { .. });
-        if matches!(self.editor.mode, EditorMode::Idle | EditorMode::Inspecting { .. } | EditorMode::FirstSelected { .. } | EditorMode::Selection) {
+        if !self.pointer_gone && matches!(self.editor.mode, EditorMode::Idle | EditorMode::Inspecting { .. } | EditorMode::FirstSelected { .. } | EditorMode::Selection) {
             if let Some((i, _)) = self.pick_body(raw) {
                 let selected = match self.editor.mode {
                     EditorMode::Selection => self.editor.selection.contains(&i),
@@ -1515,6 +1531,8 @@ impl App {
         }
 
         match self.editor.mode.clone() {
+            // A tapped tile waits for a tap in the scene: no finger, no ghost.
+            EditorMode::PlacingBody if self.pointer_gone => {}
             EditorMode::PlacingBody => {
                 let props = &self.editor.body_props;
                 match props.template {
