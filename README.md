@@ -86,3 +86,15 @@ src/
   renderer/     wgpu renderer, camera, egui HUD, shaders
   scenes/       scene definitions and shared drawing
 ```
+
+## License
+
+Copyright (C) 2026 Quirijn du Bois
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See [LICENSE](LICENSE).
+
+The bundled JetBrains Mono font (`assets/fonts/`) is under the SIL Open Font
+License 1.1 (`assets/fonts/JetBrainsMono-OFL.txt`).
