@@ -127,7 +127,7 @@ Mouse interaction: left-click picks a body (hit-tests disks and rods), attaches 
 | 22 | Pumpjacks | Three crank-rocker pumpjacks: belt-driven cranks with welded counterweights, horsehead disk welded to the beam, bridle rope over it to a sucker rod on a slider |
 | 23 | Planetary Press | Sun, three planets on a carrier, fixed internal ring (drawn with inward teeth); carrier crank drives a ram with a sprung punch over a colliding conveyor carrying blocks into a bin |
 | 24 | Geneva Drive | Crank pin (welded disk) on a heavy flywheel hub indexes a four-slot wheel (welded bars, walls ending at the pin's exit radius, flared mouth guides) through contact; a belt-driven eccentric cam rocks a sprung roller lever |
-| 25 | Pendulum Clock | Weight-driven anchor escapement: spike-toothed escape wheel (welded), slanted bar pallets welded to the pendulum, endless rope over a drum belted from a pinion; one tooth per period |
+| 25 | Pendulum Clock | Weight-driven anchor escapement (spike-toothed escape wheel, slanted bar pallets welded to the pendulum, endless rope over a drum belted from a pinion; one tooth per period); seconds, minute and hour hands through a gear train and motion work; a hammer rings the bell every minute |
 | 26 | Rimless Wheel | Ten welded spokes rolling down a slope into a limit-cycle gait, then onto the flat; camera follows |
 | 27 | Truss Bridge | Warren deck truss, members pinned in chains at nodes, every pin breakable; a motor cart crosses and it folds into the river |
 | 28 | Trebuchet | Hinged counterweight, 3:1 arm, breakable rope sling that releases at its breaking pull; the stone flies ~20 m into a block wall |

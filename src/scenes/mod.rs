@@ -243,10 +243,10 @@ pub static SCENES: &[SceneDef] = &[
     },
     SceneDef {
         name:          "Pendulum Clock",
-        description:   "Weight-driven clock: the anchor escapement lets the wheel through one tooth per swing and kicks the pendulum",
+        description:   "Weight-driven clock: anchor escapement, seconds, minute and hour hands through a gear train and motion work, a hammer rings the bell every minute",
         build:         pendulum_clock::build,
-        camera_center: [0.4, -0.4],
-        view_size:     [3.6, 3.8],
+        camera_center: [0.45, 0.75],
+        view_size:     [4.2, 6.0],
     },
     SceneDef {
         name:          "Rimless Wheel",
