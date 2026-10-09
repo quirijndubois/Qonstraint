@@ -22,6 +22,8 @@ const D: Vec2 = Vec2::new(-1.0, 0.4);      // drive axle
 const C: f32 = 1.4;                         // centre distance
 const PIN_R: f32 = 0.07;
 const WALL_HW: f32 = 0.03;
+const FLARE_LEN: f32 = 0.22;               // mouth guides: reach outwards
+const FLARE_W: f32 = 0.13;                  // and how far they spread
 const CAM: Vec2 = Vec2::new(-1.0, -1.9);    // cam shaft
 
 fn hard(mut b: Body) -> Body {
@@ -43,7 +45,9 @@ pub fn build() -> World {
     // Drive: hub disk with a crank arm and the pin at its end, starting
     // just before the pin meets the first slot.
     let start = -FRAC_PI_4 - 0.35;
-    let hub = w.add_body(disk(D, 0.3, 2.0));
+    // Heavy, as a flywheel: a light drive is slowed by each index, then
+    // races ahead and slams the pin across the slot, knocking the wheel back.
+    let hub = w.add_body(disk(D, 0.3, 16.0));
     w.add_constraint(PinWorld::new(hub, Vec2::ZERO, D));
     w.add_force(Motor::new(hub, 6.0, 2.0));
     let tip = D + Vec2::new(start.cos(), start.sin()) * a;
@@ -55,10 +59,13 @@ pub fn build() -> World {
 
     // The wheel: a hub and four slots, at 45° off the line of centres so
     // the one at −135° (from the wheel) takes the pin square on.
-    let wheel = w.add_body(disk(g, 0.42, 3.0));
+    // At least the inertia of the slots welded on it, or XPBD's sweep diverges.
+    let wheel = w.add_body(disk(g, 0.42, 10.0));
     w.add_constraint(PinWorld::new(wheel, Vec2::ZERO, g));
     w.add_force(Motor::new(wheel, 0.0, 2.5)); // bearing friction holds it between moves
-    let (r_in, r_out) = (C - a - PIN_R - 0.04, a + 0.06);
+    // The walls end exactly where the pin leaves (radius a): any further
+    // and the outgoing pin drags the wheel back off its index.
+    let (r_in, r_out) = (C - a - PIN_R - 0.04, a);
     let off = PIN_R + 0.012 + WALL_HW;
     for k in 0..4 {
         let phi = FRAC_PI_4 + k as f32 * FRAC_PI_2;
@@ -68,6 +75,15 @@ pub fn build() -> World {
             let (bar, _) = rod_between(g + u * r_in + n, g + u * r_out + n, 0.3, WALL_HW);
             let bar = w.add_body(hard(bar));
             w.add_constraint(WeldJoint::new(wheel, bar, g + u * r_in + n, &w.bodies));
+        }
+        // Flared guides at the mouth: a wheel that has crept off its
+        // index position is steered back as the pin comes in.
+        for side in [-1.0, 1.0] {
+            let n = u.perp() * side;
+            let (from, to) = (g + u * r_out + n * off, g + u * (r_out + FLARE_LEN) + n * (off + FLARE_W));
+            let (guide, _) = rod_between(from, to, 0.1, WALL_HW);
+            let guide = w.add_body(hard(guide));
+            w.add_constraint(WeldJoint::new(wheel, guide, from, &w.bodies));
         }
         // The slot's closed end.
         let (end, _) = rod_between(g + u * r_in + u.perp() * off, g + u * r_in - u.perp() * off, 0.2, WALL_HW);

@@ -7,6 +7,9 @@ use crate::sim::slot::Slot;
 use crate::sim::solver::WitkinSolver;
 use crate::sim::xpbd::{self, XpbdScratch};
 
+/// Trail length of a new trace (s).
+pub const DEFAULT_TRAIL_SECONDS: f32 = 3.0;
+
 /// A body-local point whose path the app draws as a fading trail.
 /// Pure presentation metadata: it has no effect on the physics.
 #[derive(Clone, Copy, Debug)]
@@ -91,7 +94,7 @@ impl World {
     }
 
     pub fn add_tracer(&mut self, body: usize, local: Vec2) {
-        self.tracers.push(Tracer { body, local, seconds: 3.0 });
+        self.tracers.push(Tracer { body, local, seconds: DEFAULT_TRAIL_SECONDS });
     }
 
     /// Re-capture constraint reference state after bodies were moved by hand

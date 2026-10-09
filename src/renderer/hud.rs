@@ -9,16 +9,16 @@ use winit::window::Window;
 
 use crate::analysis::{free_bodies, Analysis, PlotMode};
 use crate::library::{clean_name, Library, Source, Tile};
-use crate::editor::{BodyTemplate, ConstraintKind, Editor, EditorMode, LinkHover, StepMode};
+use crate::editor::{BodyProps, BodyTemplate, ConstraintKind, Editor, EditorMode, LinkHover, StepMode};
 use crate::sim::{
-    body::BodyShape,
+    body::{BodyShape, DEFAULT_FRICTION, DEFAULT_RESTITUTION},
     constraint::Constraint,
     constraints::{
         cylinder::{GasMode, Stroke as GasStroke}, Cylinder, DistanceConstraint, GearJoint, GearKind,
         PinJoint, PinWorld, RollingContact, RollingOnRod, Rope, SliderJoint, WeldJoint,
     },
     forces::{spring::SpringDamper, Motor, TorsionSpring},
-    world::{Integrator, World},
+    world::{Integrator, World, DEFAULT_TRAIL_SECONDS},
 };
 
 // ── Style ─────────────────────────────────────────────────────────────────────
@@ -326,6 +326,7 @@ fn draw_main_panel(
     library:     &mut Library,
 ) -> HudOutput {
     let mut out = HudOutput::default();
+    let defaults = Editor::default();
     // Folded by default on a phone, where it would cover the whole scene.
     let mut folded = editor.main_folded.unwrap_or_else(|| narrow(ctx));
 
@@ -389,8 +390,8 @@ fn draw_main_panel(
                 ui.add_space(10.0);
                 ui.label(text("Simulation", HEAD_SIZE, WHITE));
                 ui.add_space(2.0);
-                slider_row(ui, "GRAVITY", &mut editor.gravity, 0.0, 30.0);
-                log_slider_row(ui, "SPEED", &mut editor.time_scale, 0.05, 20.0);
+                slider_row(ui, "GRAVITY", &mut editor.gravity, 0.0, 30.0, defaults.gravity);
+                log_slider_row(ui, "SPEED", &mut editor.time_scale, 0.05, 20.0, defaults.time_scale);
                 ui.add_space(2.0);
                 labelled(ui, "SOLVER", |ui| {
                     segmented(ui, &mut editor.integrator, &[(Integrator::Rk4, "RK4"), (Integrator::Xpbd, "XPBD")]);
@@ -401,9 +402,9 @@ fn draw_main_panel(
                 });
                 ui.add_space(2.0);
                 match editor.step_mode {
-                    StepMode::Fixed => int_slider_row(ui, "COUNT", &mut editor.sub_steps, 1, 2000),
+                    StepMode::Fixed => int_slider_row(ui, "COUNT", &mut editor.sub_steps, 1, 2000, defaults.sub_steps),
                     // Floor of 20: frame dt is capped at 0.05 s, below that the sim would lag real time.
-                    StepMode::TargetFps => slider_row(ui, "TARGET", &mut editor.target_fps, 20.0, 240.0),
+                    StepMode::TargetFps => slider_row(ui, "TARGET", &mut editor.target_fps, 20.0, 240.0, defaults.target_fps),
                 }
                 ui.add_space(10.0);
                 ui.label(text("Show", HEAD_SIZE, WHITE));
@@ -736,17 +737,18 @@ fn selection_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut 
     if let EditorMode::Inspecting { body_idx } = editor.mode {
         let shape = editor.inspect_shape.clone().unwrap_or_else(|| "Body".into());
         if let Some(edit) = &mut editor.body_edit {
-            slider_row(ui, "MASS", &mut edit.mass, 0.1, 20.0);
+            let props = BodyProps::default();
+            slider_row(ui, "MASS", &mut edit.mass, 0.1, 20.0, props.mass);
             match shape.as_str() {
-                "Disk" => slider_row(ui, "RADIUS", &mut edit.radius,   0.05, 2.0),
+                "Disk" => slider_row(ui, "RADIUS", &mut edit.radius,   0.05, 2.0, props.radius),
                 "Rod"  => {
-                    slider_row(ui, "LENGTH", &mut edit.half_len, 0.1,  4.0);
-                    slider_row(ui, "WIDTH",  &mut edit.half_width, 0.02, 0.4);
+                    slider_row(ui, "LENGTH", &mut edit.half_len, 0.1,  4.0, props.half_len);
+                    slider_row(ui, "WIDTH",  &mut edit.half_width, 0.02, 0.4, props.half_width);
                 }
                 _      => {}
             }
             if shape != "Point" {
-                slider_row(ui, "ANGLE", &mut edit.angle, -180.0, 180.0);
+                slider_row(ui, "ANGLE", &mut edit.angle, -180.0, 180.0, 0.0);
             }
             ui.horizontal(|ui| {
                 toggle_row(ui, "FIXED", &mut edit.fixed);
@@ -758,8 +760,8 @@ fn selection_panel_contents(ui: &mut egui::Ui, editor: &mut Editor, world: &mut 
                 if follow { world.follow = Some(body_idx); } else if world.follow == Some(body_idx) { world.follow = None; }
             }
             if edit.collide && shape != "Point" {
-                slider_row(ui, "FRICTION", &mut edit.friction, 0.0, 1.5);
-                slider_row(ui, "BOUNCE", &mut edit.restitution, 0.0, 1.0);
+                slider_row(ui, "FRICTION", &mut edit.friction, 0.0, 1.5, DEFAULT_FRICTION);
+                slider_row(ui, "BOUNCE", &mut edit.restitution, 0.0, 1.0, DEFAULT_RESTITUTION);
                 labelled(ui, "PLANE", |ui| segmented(ui, &mut edit.plane, &[(0, "ALL"), (1, "1"), (2, "2"), (3, "3"), (4, "4")]));
             }
             // One-click world pins on the natural spots.
@@ -1317,6 +1319,7 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
     let mut remove_constraint = None;
     let mut remove_force = None;
     let mut count = 0;
+    let defaults = Editor::default();
     let bodies = &world.bodies;
     let other = |a: usize, b: usize| if a == body_idx { b } else { a };
 
@@ -1372,7 +1375,9 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
             if any.is::<WeldJoint>() {
                 ui.label(text("Locks position and angle // one rigid part", SMALL_SIZE, MUTED));
             } else if let Some(dc) = any.downcast_mut::<DistanceConstraint>() {
-                slider_row(ui, "LENGTH", &mut dc.rest_len, 0.05, 8.0);
+                // Default: the current span between the ends.
+                let span = (bodies[dc.body_b].world_point(dc.local_b) - bodies[dc.body_a].world_point(dc.local_a)).length();
+                slider_row(ui, "LENGTH", &mut dc.rest_len, 0.05, 8.0, span);
             } else if let Some(cy) = any.downcast_mut::<Cylinder>() {
                 ui.horizontal(|ui| {
                     for (mode, lbl) in [(GasMode::Sealed, "SEALED"), (GasMode::TwoStroke, "2-STROKE"), (GasMode::FourStroke, "4-STROKE")] {
@@ -1386,7 +1391,7 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
                 if cy.mode == GasMode::Sealed {
                     ui.label(text("Air spring // rests where it is now", SMALL_SIZE, MUTED));
                 } else {
-                    slider_row(ui, "THROTTLE", &mut cy.throttle, 0.0, 1.0);
+                    slider_row(ui, "THROTTLE", &mut cy.throttle, 0.0, 1.0, 1.0);
                     ui.label(text("Fires at top dead centre", SMALL_SIZE, MUTED));
                 }
             } else if let Some(sj) = any.downcast_mut::<SliderJoint>() {
@@ -1411,7 +1416,9 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
                     }
                 }
             } else if let Some(r) = any.downcast_mut::<Rope>() {
-                slider_row(ui, "LENGTH", &mut r.length, 0.05, 12.0);
+                // Default: taut where it runs now.
+                let taut = r.current_length(bodies) as f32;
+                slider_row(ui, "LENGTH", &mut r.length, 0.05, 12.0, taut);
                 if r.pulley.is_some() {
                     toggle_row(ui, "GRIPS PULLEY", &mut r.grip);
                 }
@@ -1424,7 +1431,7 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
             let mut breakable = break_force.is_some();
             toggle_row(ui, "BREAKABLE", &mut breakable);
             match (breakable, &mut break_force) {
-                (true, Some(f)) => log_slider_row(ui, "BREAK AT", f, 1.0, 5000.0),
+                (true, Some(f)) => log_slider_row(ui, "BREAK AT", f, 1.0, 5000.0, DEFAULT_BREAK_FORCE),
                 (true, f) => *f = Some(DEFAULT_BREAK_FORCE),
                 (false, f) => *f = None,
             }
@@ -1448,8 +1455,8 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
             count += 1;
             has_motor = true;
             let (delete, _) = link_card(ui, "Motor", Some(&mut on), |ui| {
-                slider_row(ui, "TORQUE", &mut mo.torque, -50.0, 50.0);
-                slider_row(ui, "DRAG",   &mut mo.drag,   0.0, 10.0);
+                slider_row(ui, "TORQUE", &mut mo.torque, -50.0, 50.0, 0.0);
+                slider_row(ui, "DRAG",   &mut mo.drag,   0.0, 10.0, 0.0);
                 if let Some(mount) = mount {
                     let mut mounted = mo.stator.is_some();
                     toggle_row(ui, "MOUNTED", &mut mounted);
@@ -1468,10 +1475,12 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
             let o = other(t.body_a, t.body_b);
             let title = format!("Torsion > {}", body_name(bodies, o));
             let mut rest = t.rest.to_degrees();
+            // Default: at rest at the current relative angle, as when made.
+            let now = (bodies[t.body_a].angle - bodies[t.body_b].angle).to_degrees() as f32;
             let (delete, hovered) = link_card(ui, &title, Some(&mut on), |ui| {
-                slider_row(ui, "STIFF", &mut t.stiffness, 0.5, 200.0);
-                slider_row(ui, "DAMP",  &mut t.damping,   0.0, 10.0);
-                slider_row(ui, "REST",  &mut rest, -180.0, 180.0);
+                slider_row(ui, "STIFF", &mut t.stiffness, 0.5, 200.0, defaults.torsion_k);
+                slider_row(ui, "DAMP",  &mut t.damping,   0.0, 10.0, defaults.torsion_d);
+                slider_row(ui, "REST",  &mut rest, -180.0, 180.0, now);
                 ui.label(text("Springs the relative angle", SMALL_SIZE, MUTED));
             });
             // Only write back a real change: deg → rad → deg isn't exact.
@@ -1485,10 +1494,12 @@ fn draw_connections(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> Op
         count += 1;
         let o = other(sd.body_a, sd.body_b);
         let title = format!("Spring > {}", body_name(bodies, o));
+        // Default: unstretched at the current span.
+        let span = (bodies[sd.body_b].world_point(sd.local_b) - bodies[sd.body_a].world_point(sd.local_a)).length();
         let (delete, hovered) = link_card(ui, &title, Some(&mut on), |ui| {
-            slider_row(ui, "STIFF", &mut sd.stiffness, 1.0, 500.0);
-            slider_row(ui, "DAMP",  &mut sd.damping,   0.0, 50.0);
-            slider_row(ui, "REST",  &mut sd.rest_len,  0.05, 8.0);
+            slider_row(ui, "STIFF", &mut sd.stiffness, 1.0, 500.0, defaults.spring_k);
+            slider_row(ui, "DAMP",  &mut sd.damping,   0.0, 50.0, defaults.spring_d);
+            slider_row(ui, "REST",  &mut sd.rest_len,  0.05, 8.0, span);
         });
         f.on = on;
         if delete { remove_force = Some(fi); }
@@ -1521,7 +1532,7 @@ fn draw_traces(ui: &mut egui::Ui, world: &mut World, body_idx: usize) -> (Option
         n += 1;
         let p = bodies[t.body].world_point(t.local);
         let (delete, hovered) = link_card(ui, &format!("Trace {n}"), None, |ui| {
-            slider_row(ui, "TRAIL S", &mut t.seconds, 0.5, 30.0);
+            slider_row(ui, "TRAIL S", &mut t.seconds, 0.5, 30.0, DEFAULT_TRAIL_SECONDS);
         });
         if delete { remove = Some(i); }
         if hovered { hover = Some(LinkHover::Point(p)); }
@@ -1679,32 +1690,71 @@ fn labelled<R>(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::U
     }).inner
 }
 
-/// Label, a slider stretched across the row, and its value right-aligned.
-fn slider_layout(ui: &mut egui::Ui, label: &str, value: String, slider: impl FnOnce(&mut egui::Ui)) {
+/// Width of the reset button at the right end of slider rows.
+const RESET_W: f32 = 16.0;
+
+/// Label, a slider stretched across the row, its value right-aligned and a
+/// reset button, live unless `at_default`. Returns whether reset was clicked.
+fn slider_layout(ui: &mut egui::Ui, label: &str, value: String, at_default: bool, slider: impl FnOnce(&mut egui::Ui)) -> bool {
     labelled(ui, label, |ui| {
-        let w = (ui.available_width() - VALUE_W - ui.spacing().item_spacing.x).max(40.0);
+        let gap = ui.spacing().item_spacing.x;
+        let w = (ui.available_width() - VALUE_W - RESET_W - 2.0 * gap).max(40.0);
         ui.spacing_mut().slider_width = w;
         slider(ui);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(VALUE_W), 20.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new((ui.available_width() - RESET_W - gap).clamp(0.0, VALUE_W), 20.0), Sense::hover());
         ui.painter().text(rect.right_center(), Align2::RIGHT_CENTER, value, font(BODY_SIZE), WHITE);
-    });
+        reset_btn(ui, at_default)
+    })
 }
 
-fn slider_row(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32, max: f32) {
+/// A small anticlockwise arrow: white on hover, grey otherwise, faint and
+/// inert when there's nothing to reset.
+fn reset_btn(ui: &mut egui::Ui, at_default: bool) -> bool {
+    let sense = if at_default { Sense::hover() } else { Sense::click() };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(RESET_W, 20.0), sense);
+    let color = if at_default { Color32::from_gray(60) } else if resp.hovered() { WHITE } else { MUTED };
+    let (c, r) = (rect.center(), 5.0);
+    // Open circle from the top round clockwise to upper left, arrowhead at its start.
+    let a0 = -std::f32::consts::FRAC_PI_2;
+    let pts: Vec<egui::Pos2> = (0..=16)
+        .map(|i| {
+            let a = a0 + 0.15 + (i as f32 / 16.0) * 1.6 * std::f32::consts::PI;
+            c + r * Vec2::new(a.cos(), a.sin())
+        })
+        .collect();
+    let p = ui.painter();
+    let stroke = Stroke::new(1.5_f32, color);
+    p.add(egui::Shape::line(pts.clone(), stroke));
+    let tip = pts[0];
+    p.line_segment([tip, tip + Vec2::new(-3.5, -2.5)], stroke);
+    p.line_segment([tip, tip + Vec2::new(-3.0, 3.0)], stroke);
+    resp.on_hover_text("Reset to default").clicked()
+}
+
+fn slider_row(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32, max: f32, default: f32) {
     let shown = format!("{value:.2}");
-    slider_layout(ui, label, shown, |ui| { ui.add(egui::Slider::new(value, min..=max).show_value(false)); });
+    let at_default = (*value - default).abs() <= 1e-5 * default.abs().max(1.0);
+    if slider_layout(ui, label, shown, at_default, |ui| { ui.add(egui::Slider::new(value, min..=max).show_value(false)); }) {
+        *value = default;
+    }
 }
 
 /// Like `slider_row` but logarithmic, for ranges spanning orders of magnitude.
-fn log_slider_row(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32, max: f32) {
+fn log_slider_row(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32, max: f32, default: f32) {
     let shown = format!("{value:.2}");
-    slider_layout(ui, label, shown, |ui| { ui.add(egui::Slider::new(value, min..=max).logarithmic(true).show_value(false)); });
+    let at_default = (*value - default).abs() <= 1e-5 * default.abs().max(1.0);
+    if slider_layout(ui, label, shown, at_default, |ui| { ui.add(egui::Slider::new(value, min..=max).logarithmic(true).show_value(false)); }) {
+        *value = default;
+    }
 }
 
-fn int_slider_row(ui: &mut egui::Ui, label: &str, value: &mut u32, min: u32, max: u32) {
+fn int_slider_row(ui: &mut egui::Ui, label: &str, value: &mut u32, min: u32, max: u32, default: u32) {
     let shown = value.to_string();
+    let at_default = *value == default;
     // Logarithmic so the low, common values stay easy to hit.
-    slider_layout(ui, label, shown, |ui| { ui.add(egui::Slider::new(value, min..=max).logarithmic(true).show_value(false)); });
+    if slider_layout(ui, label, shown, at_default, |ui| { ui.add(egui::Slider::new(value, min..=max).logarithmic(true).show_value(false)); }) {
+        *value = default;
+    }
 }
 
 /// A one-of switch across the rest of the row: a bordered track with a

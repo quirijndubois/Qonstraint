@@ -53,12 +53,24 @@ pub fn clean_name(name: &str) -> String {
         .collect()
 }
 
+/// Where saved scenes go when the platform says so itself (Android: the
+/// app's private data folder, which has no `HOME` to derive it from).
+#[cfg(not(target_arch = "wasm32"))]
+static DATA_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn set_data_dir(dir: std::path::PathBuf) {
+    let _ = DATA_DIR.set(dir);
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod store {
     use super::Saved;
     use std::path::PathBuf;
 
     fn dir() -> Option<PathBuf> {
+        if let Some(d) = super::DATA_DIR.get() { return Some(d.join("scenes")); }
         let base = if cfg!(windows) {
             std::env::var_os("APPDATA").map(PathBuf::from)
         } else {

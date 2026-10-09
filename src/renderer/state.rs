@@ -16,7 +16,10 @@ struct Uniforms {
 const MSAA_SAMPLES: u32 = 4;
 
 pub struct RenderState {
-    pub surface: wgpu::Surface<'static>,
+    /// `None` while the app is suspended: Android takes the window's
+    /// surface away then and hands out a new one on resume.
+    pub surface: Option<wgpu::Surface<'static>>,
+    instance: wgpu::Instance,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
@@ -61,37 +64,53 @@ fn create_msaa_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration, 
 
 impl RenderState {
     pub async fn new(window: &'static Window) -> Self {
+        // Android: Vulkan first. Some drivers (and the emulator's software
+        // Vulkan) refuse to make its swapchain; OpenGL ES works everywhere.
+        #[cfg(target_os = "android")]
+        {
+            if let Some(state) = Self::with_backends(window, wgpu::Backends::VULKAN).await {
+                return state;
+            }
+            log::warn!("Vulkan unusable, falling back to OpenGL ES");
+            Self::with_backends(window, wgpu::Backends::GL).await.expect("no usable GPU backend")
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            #[cfg(not(target_arch = "wasm32"))]
+            let backends = wgpu::Backends::all();
+            // `?webgl` in the page URL forces WebGL2 even where WebGPU exists.
+            #[cfg(target_arch = "wasm32")]
+            let backends = match web_sys::window().and_then(|w| w.location().search().ok()) {
+                Some(q) if q.contains("webgl") => wgpu::Backends::GL,
+                _ => wgpu::Backends::all(),
+            };
+            Self::with_backends(window, backends).await.expect("no usable GPU backend")
+        }
+    }
+
+    /// Everything set up on one of `backends`, or `None` if any step fails
+    /// there (no adapter, no device, or the surface won't configure).
+    async fn with_backends(window: &'static Window, backends: wgpu::Backends) -> Option<Self> {
         let size = window.inner_size();
-        #[cfg(not(target_arch = "wasm32"))]
-        let backends = wgpu::Backends::all();
-        // `?webgl` in the page URL forces WebGL2 even where WebGPU exists.
-        #[cfg(target_arch = "wasm32")]
-        let backends = match web_sys::window().and_then(|w| w.location().search().ok()) {
-            Some(q) if q.contains("webgl") => wgpu::Backends::GL,
-            _ => wgpu::Backends::all(),
-        };
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
             ..Default::default()
         });
-        let surface = instance.create_surface(window).unwrap();
+        let surface = instance.create_surface(window).ok()?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
-            .await
-            .unwrap();
-        #[cfg(target_arch = "wasm32")]
-        {
-            let info = adapter.get_info();
-            log::warn!("wgpu backend: {:?} ({})", info.backend, info.name);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
+            .await?;
+        let info = adapter.get_info();
+        #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+        log::warn!("wgpu backend: {:?} ({})", info.backend, info.name);
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
         let device_desc = wgpu::DeviceDescriptor::default();
-        // Desktop default limits exceed what WebGL2 offers.
-        #[cfg(target_arch = "wasm32")]
+        // Desktop default limits exceed what WebGL2 and many phone GPUs offer.
+        #[cfg(any(target_arch = "wasm32", target_os = "android"))]
         let device_desc = wgpu::DeviceDescriptor {
             required_limits: wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
             ..Default::default()
@@ -99,9 +118,10 @@ impl RenderState {
         let (device, queue) = adapter
             .request_device(&device_desc, None)
             .await
-            .unwrap();
+            .ok()?;
 
         let surface_caps = surface.get_capabilities(&adapter);
+        if surface_caps.formats.is_empty() { return None; }
         let surface_format = surface_caps
             .formats
             .iter()
@@ -124,7 +144,15 @@ impl RenderState {
             view_formats:                   if view_format != surface_format { vec![view_format] } else { vec![] },
             desired_maximum_frame_latency:  2,
         };
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
         surface.configure(&device, &config);
+        if let Some(e) = device.pop_error_scope().await {
+            log::error!("surface won't configure on {:?}: {e}", info.backend);
+            // wgpu's device teardown expects its queue gone first.
+            drop(queue);
+            drop(device);
+            return None;
+        }
 
         let msaa_view = create_msaa_view(&device, &config, view_format);
 
@@ -248,15 +276,15 @@ impl RenderState {
             mapped_at_creation: false,
         });
 
-        Self {
-            surface, device, queue, config, size, view_format,
+        Some(Self {
+            surface: Some(surface), instance, device, queue, config, size, view_format,
             grid_pipeline, geo_pipeline,
             uniform_buffer, bind_group,
             vertex_buffer, index_buffer,
             vertex_capacity: INITIAL_VERTS,
             index_capacity:  INITIAL_IDXS,
             msaa_view,
-        }
+        })
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -264,8 +292,27 @@ impl RenderState {
             self.size = new_size;
             self.config.width  = new_size.width;
             self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
+            if let Some(surface) = &self.surface { surface.configure(&self.device, &self.config); }
             self.msaa_view = create_msaa_view(&self.device, &self.config, self.view_format);
+        }
+    }
+
+    /// Let go of the window surface (Android: the app went to the background).
+    pub fn drop_surface(&mut self) {
+        self.surface = None;
+    }
+
+    /// Make a surface for the window again after `drop_surface`, on the same
+    /// device, so pipelines, buffers and egui textures all carry over.
+    pub fn recreate_surface(&mut self, window: &'static Window) {
+        if self.surface.is_some() { return; }
+        match self.instance.create_surface(window) {
+            Ok(surface) => {
+                self.surface = Some(surface);
+                self.size = winit::dpi::PhysicalSize::new(0, 0);
+                self.resize(window.inner_size());
+            }
+            Err(e) => log::error!("no surface on resume: {e}"),
         }
     }
 
@@ -278,7 +325,7 @@ impl RenderState {
     ) -> Result<(wgpu::SurfaceTexture, wgpu::TextureView, wgpu::CommandEncoder), wgpu::SurfaceError> {
         self.upload(camera, geo, self.size.width as f32, self.size.height as f32);
 
-        let output = self.surface.get_current_texture()?;
+        let output = self.surface.as_ref().ok_or(wgpu::SurfaceError::Lost)?.get_current_texture()?;
         let surface_view = output.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.view_format),
             ..Default::default()

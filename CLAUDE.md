@@ -13,9 +13,12 @@ cargo test --release bench_scenes -- --ignored --nocapture   # physics benchmark
 PROBE="Scene Name" cargo test --release probe -- --ignored --nocapture --exact scenes::probe::probe   # one scene's energy, error, extent, contacts, joint load over time
 trunk serve          # browser build at http://127.0.0.1:8080 (trunk build --release → dist/)
 cargo check --target wasm32-unknown-unknown   # type-check the web build
+./android.sh build   # Android APK → target/release/apk/qonstraint.apk (./android.sh run installs and starts it over USB)
 ```
 
-Web build needs the wasm target and trunk (Arch: `pacman -S rust-wasm trunk`). It uses WebGPU and falls back to WebGL2. Everything web-specific sits behind `cfg(target_arch = "wasm32")` (window/canvas setup, async init via a `UserEvent` and no `ControlFlow::Poll` — it starves Firefox's animation frames — in `main.rs`, WebGL2 limits and the sRGB `view_format` in `renderer/state.rs`, refitting the camera on the first resize in `app.rs`); keep the native path free of web changes. Use `web_time::Instant`, never `std::time::Instant` (it panics on wasm).
+Web build needs the wasm target and trunk (Arch: `pacman -S rust-wasm trunk`). It uses WebGPU and falls back to WebGL2. Everything web-specific sits behind `cfg(target_arch = "wasm32")` (window/canvas setup, async init via a `UserEvent` and no `ControlFlow::Poll` — it starves Firefox's animation frames — in `lib.rs`, WebGL2 limits and the sRGB `view_format` in `renderer/state.rs`, refitting the camera on the first resize in `app.rs`); keep the native path free of web changes. Use `web_time::Instant`, never `std::time::Instant` (it panics on wasm).
+
+Android build: `android.sh` runs `cargo apk` (install: `cargo install cargo-apk`) through a user-local rustup in `~/.cargo/bin` with the `aarch64-linux-android` / `x86_64-linux-android` targets (the Arch system Rust has none), the SDK in `~/Android/Sdk` and its newest NDK; cargo-apk needs an SDK platform the NDK supports (NDK 26: `platforms;android-34`). Release, signed with `~/.android/debug.keystore`. APK settings are `[package.metadata.android]` in `Cargo.toml`. The app is a library (`qonstraint`, `src/lib.rs`, `crate-type = cdylib + rlib`) so Android can load it through `android_main`; `src/main.rs` (the `physics_sim` binary trunk builds, `data-bin` in `index.html`) just calls `qonstraint::main`. Android-specific: `Suspended` drops the wgpu surface and `Resumed` recreates it on the same device (`RenderState::drop_surface` / `recreate_surface`; no redraws in between), Vulkan is tried before OpenGL ES and any backend whose surface won't configure is skipped (`RenderState::with_backends`), device limits are the WebGL2-level ones as on the web, saved scenes go to the app's internal data folder (`library::set_data_dir`), logs and panics go to logcat (tag `qonstraint`), and the egui clipboard (share codes, copy/paste text) does nothing there.
 
 The app opens a wgpu window. Pan with middle-mouse drag, zoom with scroll wheel. Left-click drag to pull bodies with a mouse spring.
 
@@ -23,7 +26,7 @@ Touch (`App::on_touch`; winit delivers touch as `WindowEvent::Touch`, never as m
 
 ## Architecture
 
-Single Rust binary. Top-level modules: `sim` (physics), `renderer` (wgpu + egui), `scenes` (scene definitions), `app` (input/update/render loop), `editor`, `analysis` (rewind, butterfly, phase plot, undo), `scene_file` (save/load/share).
+Rust library plus a thin binary (see the Android paragraph). Top-level modules: `sim` (physics), `renderer` (wgpu + egui), `scenes` (scene definitions), `app` (input/update/render loop), `editor`, `analysis` (rewind, butterfly, phase plot, undo), `scene_file` (save/load/share).
 
 ### App (`src/app.rs`)
 
@@ -123,7 +126,7 @@ Mouse interaction: left-click picks a body (hit-tests disks and rods), attaches 
 | 21 | Domino Cascade | Ten dominoes (bar welded on a foot), each 1.32× the last, tapped by a pendulum |
 | 22 | Pumpjacks | Three crank-rocker pumpjacks: belt-driven cranks with welded counterweights, horsehead disk welded to the beam, bridle rope over it to a sucker rod on a slider |
 | 23 | Planetary Press | Sun, three planets on a carrier, fixed internal ring (drawn with inward teeth); carrier crank drives a ram with a sprung punch over a colliding conveyor carrying blocks into a bin |
-| 24 | Geneva Drive | Crank pin (welded disk) indexes a four-slot wheel (welded bars) through contact; a belt-driven eccentric cam rocks a sprung roller lever |
+| 24 | Geneva Drive | Crank pin (welded disk) on a heavy flywheel hub indexes a four-slot wheel (welded bars, walls ending at the pin's exit radius, flared mouth guides) through contact; a belt-driven eccentric cam rocks a sprung roller lever |
 | 25 | Pendulum Clock | Weight-driven anchor escapement: spike-toothed escape wheel (welded), slanted bar pallets welded to the pendulum, endless rope over a drum belted from a pinion; one tooth per period |
 | 26 | Rimless Wheel | Ten welded spokes rolling down a slope into a limit-cycle gait, then onto the flat; camera follows |
 | 27 | Truss Bridge | Warren deck truss, members pinned in chains at nodes, every pin breakable; a motor cart crosses and it folds into the river |
